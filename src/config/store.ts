@@ -77,6 +77,27 @@ function stripSecrets(provider: ProviderConfig): {
         secrets,
       };
     }
+    case "dropbox": {
+      const { clientSecret, refreshToken, accessToken, ...rest } = provider;
+      const secrets: Record<string, string> = { clientSecret, refreshToken };
+      if (accessToken) secrets.accessToken = accessToken;
+      return {
+        public: {
+          ...rest,
+          clientSecret: "",
+          refreshToken: "",
+          accessToken: undefined,
+        },
+        secrets,
+      };
+    }
+    case "webdav": {
+      const { password, ...rest } = provider;
+      return {
+        public: { ...rest, password: "" },
+        secrets: { password },
+      };
+    }
   }
 }
 
@@ -107,6 +128,18 @@ function mergeSecrets(
         clientSecret: secrets.clientSecret ?? provider.clientSecret,
         refreshToken: secrets.refreshToken ?? provider.refreshToken,
         accessToken: secrets.accessToken ?? provider.accessToken,
+      };
+    case "dropbox":
+      return {
+        ...provider,
+        clientSecret: secrets.clientSecret ?? provider.clientSecret,
+        refreshToken: secrets.refreshToken ?? provider.refreshToken,
+        accessToken: secrets.accessToken ?? provider.accessToken,
+      };
+    case "webdav":
+      return {
+        ...provider,
+        password: secrets.password ?? provider.password,
       };
   }
 }
@@ -257,7 +290,7 @@ export async function updateProviderTokens(
   const config = await loadConfig();
   const patch = (p: ProviderConfig): ProviderConfig => {
     if (p.name !== name) return p;
-    if (p.kind !== "gdrive" && p.kind !== "onedrive") {
+    if (p.kind !== "gdrive" && p.kind !== "onedrive" && p.kind !== "dropbox") {
       throw new Error(`Provider "${name}" does not use OAuth tokens.`);
     }
     return { ...p, ...tokens };

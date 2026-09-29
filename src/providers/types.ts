@@ -13,12 +13,18 @@ export interface PutObjectResult {
   remotePath: string;
   /** Concrete destination for this provider (absolute path, s3 URI, etc.). */
   destination: string;
+  /** True when put was skipped because an identical-size object already existed. */
+  skipped?: boolean;
 }
 
 export interface GetObjectResult {
   body: Buffer;
   size: number;
   contentType?: string;
+}
+
+export interface HeadObjectResult {
+  size: number;
 }
 
 export interface CloudProvider {
@@ -29,6 +35,8 @@ export interface CloudProvider {
   putObject(input: PutObjectInput): Promise<PutObjectResult>;
   /** Read back an object previously stored (used to replicate from the hub). */
   getObject(remotePath: string): Promise<GetObjectResult>;
+  /** Optional metadata probe for skip-if-same-size. */
+  headObject?(remotePath: string): Promise<HeadObjectResult | null>;
 }
 
 export type ProviderFactory = (config: ProviderConfig) => CloudProvider;
