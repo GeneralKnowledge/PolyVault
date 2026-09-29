@@ -1,6 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import open from "open";
-import { addProvider, loadConfig } from "../config/store.js";
+import { addProvider, loadConfig, setPrimaryProvider } from "../config/store.js";
 import type { ProviderKind } from "../config/types.js";
 import { linkGoogleDrive, linkOneDrive } from "../providers/index.js";
 import { resolveLocalPath } from "../util/path.js";
@@ -17,27 +17,42 @@ export async function runProviderList(): Promise<void> {
     return;
   }
 
-  console.log(`Providers (${config.providers.length}):\n`);
+  console.log(`Providers (${config.providers.length}):`);
+  if (config.primaryProvider) {
+    console.log(
+      `Primary hub (receives original upload): ${config.primaryProvider}\n`,
+    );
+  } else {
+    console.log("");
+  }
   for (const p of config.providers) {
+    const hub = p.name === config.primaryProvider ? "  ★ primary" : "";
     switch (p.kind) {
       case "local":
-        console.log(`  • ${p.name}  [local]  path=${p.path}`);
+        console.log(`  • ${p.name}  [local]  path=${p.path}${hub}`);
         break;
       case "s3":
         console.log(
-          `  • ${p.name}  [s3]  bucket=${p.bucket}  endpoint=${p.endpoint}`,
+          `  • ${p.name}  [s3]  bucket=${p.bucket}  endpoint=${p.endpoint}${hub}`,
         );
         break;
       case "gdrive":
-        console.log(`  • ${p.name}  [gdrive]  clientId=${p.clientId.slice(0, 12)}…`);
+        console.log(
+          `  • ${p.name}  [gdrive]  clientId=${p.clientId.slice(0, 12)}…${hub}`,
+        );
         break;
       case "onedrive":
         console.log(
-          `  • ${p.name}  [onedrive]  clientId=${p.clientId.slice(0, 12)}…  tenant=${p.tenant ?? "common"}`,
+          `  • ${p.name}  [onedrive]  clientId=${p.clientId.slice(0, 12)}…  tenant=${p.tenant ?? "common"}${hub}`,
         );
         break;
     }
   }
+}
+
+export async function runProviderSetPrimary(name: string): Promise<void> {
+  await setPrimaryProvider(name);
+  console.log(`Primary hub set to "${name}" (original uploads go here first).`);
 }
 
 export async function runProviderAdd(
@@ -54,6 +69,7 @@ export async function runProviderAdd(
     clientId?: string;
     clientSecret?: string;
     tenant?: string;
+    primary?: boolean;
   },
 ): Promise<void> {
   const valid: ProviderKind[] = ["local", "s3", "gdrive", "onedrive"];
@@ -63,10 +79,11 @@ export async function runProviderAdd(
     );
   }
 
+  let addedName = "";
+
   switch (kind as ProviderKind) {
     case "local": {
-      const name =
-        flags.name ?? (await prompt("Provider name", "local"));
+      const name = flags.name ?? (await prompt("Provider name", "local"));
       const pathRaw =
         flags.path ?? (await promptRequired("Local destination directory"));
       const path = resolveLocalPath(pathRaw);
@@ -79,6 +96,7 @@ export async function runProviderAdd(
         );
       }
       await addProvider({ kind: "local", name, path });
+      addedName = name;
       console.log(`Added local provider "${name}" → ${path}`);
       break;
     }
@@ -89,10 +107,8 @@ export async function runProviderAdd(
         (await promptRequired(
           "S3 endpoint URL (e.g. https://<account>.r2.cloudflarestorage.com)",
         ));
-      const region =
-        flags.region ?? (await prompt("Region", "auto"));
-      const bucket =
-        flags.bucket ?? (await promptRequired("Bucket name"));
+      const region = flags.region ?? (await prompt("Region", "auto"));
+      const bucket = flags.bucket ?? (await promptRequired("Bucket name"));
       const accessKeyId =
         flags.accessKeyId ?? (await promptRequired("Access key ID"));
       const secretAccessKey =
@@ -108,6 +124,7 @@ export async function runProviderAdd(
         secretAccessKey,
         forcePathStyle,
       });
+      addedName = name;
       console.log(`Added S3 provider "${name}" → s3://${bucket} @ ${endpoint}`);
       break;
     }
@@ -125,6 +142,7 @@ export async function runProviderAdd(
         openBrowser,
       });
       await addProvider(linked);
+      addedName = name;
       console.log(`Added Google Drive provider "${name}"`);
       break;
     }
@@ -136,8 +154,7 @@ export async function runProviderAdd(
       const clientSecret =
         flags.clientSecret ??
         (await promptRequired("Microsoft OAuth client secret"));
-      const tenant =
-        flags.tenant ?? (await prompt("Tenant", "common"));
+      const tenant = flags.tenant ?? (await prompt("Tenant", "common"));
       const linked = await linkOneDrive({
         name,
         clientId,
@@ -146,8 +163,21 @@ export async function runProviderAdd(
         openBrowser,
       });
       await addProvider(linked);
+      addedName = name;
       console.log(`Added OneDrive provider "${name}"`);
       break;
+    }
+  }
+
+  if (flags.primary && addedName) {
+    await setPrimaryProvider(addedName);
+    console.log(`Marked "${addedName}" as primary hub.`);
+  } else {
+    const config = await loadConfig();
+    if (config.primaryProvider === addedName) {
+      console.log(
+        `(Primary hub — original file uploads here once, then replicates outward.)`,
+      );
     }
   }
 }

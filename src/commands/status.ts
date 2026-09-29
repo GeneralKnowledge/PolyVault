@@ -6,6 +6,7 @@ export async function runStatus(): Promise<void> {
   console.log(`PolyVault home: ${getPolyVaultHome()}`);
   console.log(`Config:         ${getConfigPath()}`);
   console.log(`Default remote: ${config.defaultRemoteDir}`);
+  console.log(`Primary hub:    ${config.primaryProvider ?? "(none)"}`);
   console.log(`Providers:      ${config.providers.length}`);
 
   if (config.providers.length > 0) {
@@ -17,7 +18,8 @@ export async function runStatus(): Promise<void> {
           : p.kind === "s3"
             ? `${p.bucket} @ ${p.endpoint}`
             : p.kind;
-      console.log(`  • ${p.name} [${p.kind}] ${detail}`);
+      const hub = p.name === config.primaryProvider ? " ★ primary" : "";
+      console.log(`  • ${p.name} [${p.kind}] ${detail}${hub}`);
     }
   }
 
@@ -27,11 +29,13 @@ export async function runStatus(): Promise<void> {
     console.log(`  at:        ${lp.at}`);
     console.log(`  file:      ${lp.file}`);
     console.log(`  remoteDir: ${lp.remoteDir}`);
+    console.log(`  primary:   ${lp.primary ?? "?"}`);
     for (const r of lp.results) {
+      const role = r.role ? ` (${r.role})` : "";
       if (r.ok) {
-        console.log(`  ✓ ${r.name}: ${r.destination ?? r.remotePath}`);
+        console.log(`  ✓ ${r.name}${role}: ${r.destination ?? r.remotePath}`);
       } else {
-        console.log(`  ✗ ${r.name}: ${r.error}`);
+        console.log(`  ✗ ${r.name}${role}: ${r.error}`);
       }
     }
   } else {

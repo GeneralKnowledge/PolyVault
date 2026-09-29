@@ -1,12 +1,18 @@
 import {
   CreateBucketCommand,
+  GetObjectCommand,
   HeadBucketCommand,
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
 import { Readable } from "node:stream";
 import type { S3ProviderConfig } from "../config/types.js";
-import type { CloudProvider, PutObjectInput, PutObjectResult } from "./types.js";
+import type {
+  CloudProvider,
+  GetObjectResult,
+  PutObjectInput,
+  PutObjectResult,
+} from "./types.js";
 
 async function streamToBuffer(body: Readable | Buffer): Promise<Buffer> {
   if (Buffer.isBuffer(body)) return body;
@@ -70,6 +76,22 @@ export class S3Provider implements CloudProvider {
     return {
       remotePath: key,
       destination: `s3://${this.bucket}/${key}`,
+    };
+  }
+
+  async getObject(remotePath: string): Promise<GetObjectResult> {
+    const key = remotePath.replace(/^\/+/, "");
+    const res = await this.client.send(
+      new GetObjectCommand({ Bucket: this.bucket, Key: key }),
+    );
+    if (!res.Body) {
+      throw new Error(`S3 object empty: s3://${this.bucket}/${key}`);
+    }
+    const body = await streamToBuffer(res.Body as Readable);
+    return {
+      body,
+      size: body.length,
+      contentType: res.ContentType,
     };
   }
 

@@ -15,12 +15,20 @@ export interface PutObjectResult {
   destination: string;
 }
 
+export interface GetObjectResult {
+  body: Buffer;
+  size: number;
+  contentType?: string;
+}
+
 export interface CloudProvider {
   readonly kind: ProviderKind;
   readonly name: string;
   /** Human-readable destination root (folder, bucket, drive account). */
   describeDestination(): string;
   putObject(input: PutObjectInput): Promise<PutObjectResult>;
+  /** Read back an object previously stored (used to replicate from the hub). */
+  getObject(remotePath: string): Promise<GetObjectResult>;
 }
 
 export type ProviderFactory = (config: ProviderConfig) => CloudProvider;

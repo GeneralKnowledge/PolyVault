@@ -181,6 +181,19 @@ export async function addProvider(provider: ProviderConfig): Promise<void> {
     throw new Error(`Provider "${provider.name}" already exists.`);
   }
   config.providers.push(provider);
+  // First linked provider becomes the hub that receives the original upload.
+  if (!config.primaryProvider) {
+    config.primaryProvider = provider.name;
+  }
+  await saveConfig(config);
+}
+
+export async function setPrimaryProvider(name: string): Promise<void> {
+  const config = await loadConfig();
+  if (!config.providers.some((p) => p.name === name)) {
+    throw new Error(`Provider "${name}" not found.`);
+  }
+  config.primaryProvider = name;
   await saveConfig(config);
 }
 

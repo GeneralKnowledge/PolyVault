@@ -48,10 +48,12 @@ export interface PutResultRecord {
   at: string;
   file: string;
   remoteDir: string;
+  primary?: string;
   results: Array<{
     name: string;
     kind: ProviderKind;
     ok: boolean;
+    role?: "primary" | "replica";
     remotePath?: string;
     destination?: string;
     error?: string;
@@ -61,6 +63,8 @@ export interface PutResultRecord {
 export interface PolyVaultConfig {
   version: 1;
   defaultRemoteDir: string;
+  /** Provider name that receives the original upload; others are replicas. */
+  primaryProvider?: string;
   providers: ProviderConfig[];
   lastPut?: PutResultRecord;
 }

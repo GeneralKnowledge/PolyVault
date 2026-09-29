@@ -1,19 +1,23 @@
 import { createReadStream } from "node:fs";
-import { realpath, stat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { copyFile, mkdir, realpath, stat } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { loadConfig, recordLastPut } from "../config/store.js";
 import type { ProviderConfig, ProviderKind } from "../config/types.js";
-import { createProvider } from "../providers/index.js";
+import { createProvider, LocalProvider } from "../providers/index.js";
+import type { CloudProvider } from "../providers/types.js";
 import { buildRemotePath } from "../util/path.js";
 
 export interface PutOptions {
   to?: string;
   remoteDir?: string;
+  /** Override which provider receives the original upload. */
+  primary?: string;
 }
 
 export interface ProviderPutOutcome {
   name: string;
   kind: ProviderKind;
+  role: "primary" | "replica";
   ok: boolean;
   remotePath?: string;
   destination?: string;
@@ -34,7 +38,6 @@ function selectProviders(
   return all.filter((p) => names.includes(p.name));
 }
 
-/** Resolve local roots so we can detect accidental duplicate destinations. */
 async function resolveLocalRoot(path: string): Promise<string> {
   try {
     return await realpath(path);
@@ -66,12 +69,50 @@ async function assertDistinctDestinations(
     const prior = seen.get(key);
     if (prior) {
       throw new Error(
-        `Providers "${prior}" and "${t.name}" point at the same destination. ` +
-          `Link distinct clouds/folders so one put fans out, not duplicate uploads.`,
+        `Providers "${prior}" and "${t.name}" point at the same destination.`,
       );
     }
     seen.set(key, t.name);
   }
+}
+
+function pickPrimary(
+  targets: ProviderConfig[],
+  preferred?: string,
+): ProviderConfig {
+  if (preferred) {
+    const found = targets.find((t) => t.name === preferred);
+    if (!found) {
+      throw new Error(
+        `Primary provider "${preferred}" is not in the put target list.`,
+      );
+    }
+    return found;
+  }
+  return targets[0]!;
+}
+
+async function replicateFromHub(
+  hub: CloudProvider,
+  replica: CloudProvider,
+  remotePath: string,
+): Promise<{ remotePath: string; destination: string }> {
+  // Fast path: local → local copy from the hub file (never re-reads the original).
+  if (hub instanceof LocalProvider && replica instanceof LocalProvider) {
+    const src = hub.resolveAbsolute(remotePath);
+    const dest = replica.resolveAbsolute(remotePath);
+    await mkdir(dirname(dest), { recursive: true });
+    await copyFile(src, dest);
+    return { remotePath, destination: dest };
+  }
+
+  const object = await hub.getObject(remotePath);
+  return replica.putObject({
+    remotePath,
+    body: object.body,
+    size: object.size,
+    contentType: object.contentType,
+  });
 }
 
 export async function runPut(
@@ -96,84 +137,156 @@ export async function runPut(
 
   await assertDistinctDestinations(targets);
 
+  const primaryConfig = pickPrimary(
+    targets,
+    options.primary ?? config.primaryProvider,
+  );
+  const replicas = targets.filter((t) => t.name !== primaryConfig.name);
+
   const remoteDir = options.remoteDir ?? config.defaultRemoteDir;
   const remotePath = buildRemotePath(remoteDir, filePath);
   const size = fileStat.size;
 
-  console.log(`Uploading once from ${filePath}`);
+  console.log(`Source: ${filePath}`);
   console.log(`Remote path: ${remotePath}`);
-  console.log(`Fan-out to ${targets.length} distinct destination(s):\n`);
-  for (const t of targets) {
-    const provider = createProvider(t);
-    console.log(`  • ${t.name} [${t.kind}] → ${provider.describeDestination()}`);
+  console.log(
+    `Upload once → primary "${primaryConfig.name}" [${primaryConfig.kind}]`,
+  );
+  if (replicas.length > 0) {
+    console.log(
+      `Then replicate hub → ${replicas.map((r) => r.name).join(", ")}`,
+    );
   }
   console.log("");
 
-  const outcomes = await Promise.all(
-    targets.map(async (providerConfig): Promise<ProviderPutOutcome> => {
-      const started = Date.now();
-      try {
-        const provider = createProvider(providerConfig);
-        // Independent stream per destination — parallel fan-out, not sequential re-puts.
-        const body = createReadStream(filePath);
-        const result = await provider.putObject({
-          remotePath,
-          body,
-          size,
-        });
-        return {
-          name: providerConfig.name,
-          kind: providerConfig.kind,
-          ok: true,
-          remotePath: result.remotePath,
-          destination: result.destination,
-          ms: Date.now() - started,
-        };
-      } catch (err) {
-        return {
-          name: providerConfig.name,
-          kind: providerConfig.kind,
-          ok: false,
-          error: err instanceof Error ? err.message : String(err),
-          ms: Date.now() - started,
-        };
+  const outcomes: ProviderPutOutcome[] = [];
+
+  // 1) Upload the original exactly once, to the primary hub.
+  const primaryStarted = Date.now();
+  const primaryProvider = createProvider(primaryConfig);
+  try {
+    const result = await primaryProvider.putObject({
+      remotePath,
+      body: createReadStream(filePath),
+      size,
+    });
+    outcomes.push({
+      name: primaryConfig.name,
+      kind: primaryConfig.kind,
+      role: "primary",
+      ok: true,
+      remotePath: result.remotePath,
+      destination: result.destination,
+      ms: Date.now() - primaryStarted,
+    });
+    console.log(
+      `  ✓ primary ${primaryConfig.name} ← original upload (${outcomes[0]!.ms}ms)`,
+    );
+    console.log(`      ${result.destination}`);
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    outcomes.push({
+      name: primaryConfig.name,
+      kind: primaryConfig.kind,
+      role: "primary",
+      ok: false,
+      error,
+      ms: Date.now() - primaryStarted,
+    });
+    console.log(`  ✗ primary ${primaryConfig.name} FAILED`);
+    console.log(`      ${error}`);
+    console.log(
+      "\nPrimary upload failed — original was not uploaded; skipping replication.",
+    );
+
+    await recordLastPut({
+      at: new Date().toISOString(),
+      file: filePath,
+      remoteDir,
+      primary: primaryConfig.name,
+      results: outcomes.map((o) => ({
+        name: o.name,
+        kind: o.kind,
+        ok: o.ok,
+        role: o.role,
+        remotePath: o.remotePath,
+        destination: o.destination,
+        error: o.error,
+      })),
+    });
+    return outcomes;
+  }
+
+  // 2) Replicate from the hub copy — do not re-upload the original source.
+  if (replicas.length > 0) {
+    console.log("");
+    const replicaOutcomes = await Promise.all(
+      replicas.map(async (replicaConfig): Promise<ProviderPutOutcome> => {
+        const started = Date.now();
+        try {
+          const replica = createProvider(replicaConfig);
+          const result = await replicateFromHub(
+            primaryProvider,
+            replica,
+            remotePath,
+          );
+          return {
+            name: replicaConfig.name,
+            kind: replicaConfig.kind,
+            role: "replica",
+            ok: true,
+            remotePath: result.remotePath,
+            destination: result.destination,
+            ms: Date.now() - started,
+          };
+        } catch (err) {
+          return {
+            name: replicaConfig.name,
+            kind: replicaConfig.kind,
+            role: "replica",
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+            ms: Date.now() - started,
+          };
+        }
+      }),
+    );
+    outcomes.push(...replicaOutcomes);
+
+    for (const o of replicaOutcomes) {
+      if (o.ok) {
+        console.log(
+          `  ✓ replica ${o.name} ← from hub (${o.ms}ms)`,
+        );
+        console.log(`      ${o.destination}`);
+      } else {
+        console.log(`  ✗ replica ${o.name} FAILED (${o.ms}ms)`);
+        console.log(`      ${o.error}`);
       }
-    }),
-  );
-
-  const ordered = targets.map(
-    (t) => outcomes.find((o) => o.name === t.name)!,
-  );
-
-  console.log("Results:");
-  for (const o of ordered) {
-    if (o.ok) {
-      console.log(`  ✓ ${o.name} [${o.kind}] ${o.destination} (${o.ms}ms)`);
-    } else {
-      console.log(`  ✗ ${o.name} [${o.kind}] FAILED (${o.ms}ms)`);
-      console.log(`      ${o.error}`);
     }
   }
 
-  const okCount = ordered.filter((o) => o.ok).length;
-  const failCount = ordered.length - okCount;
-  console.log(`\n${okCount} distinct destinations succeeded, ${failCount} failed`);
+  const okCount = outcomes.filter((o) => o.ok).length;
+  const failCount = outcomes.length - okCount;
+  console.log(
+    `\nDone: original uploaded once to primary; ${okCount} place(s) have the file, ${failCount} failed`,
+  );
 
   await recordLastPut({
     at: new Date().toISOString(),
     file: filePath,
     remoteDir,
-    results: ordered.map(
-      ({ name, kind, ok, remotePath: rp, destination, error }) => ({
-        name,
-        kind,
-        ok,
-        remotePath: rp,
-        destination,
-        error,
-      }),
-    ),
+    primary: primaryConfig.name,
+    results: outcomes.map((o) => ({
+      name: o.name,
+      kind: o.kind,
+      ok: o.ok,
+      role: o.role,
+      remotePath: o.remotePath,
+      destination: o.destination,
+      error: o.error,
+    })),
   });
 
-  return ordered;
+  return outcomes;
 }

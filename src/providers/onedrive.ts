@@ -3,7 +3,12 @@ import { Readable } from "node:stream";
 import type { OneDriveProviderConfig } from "../config/types.js";
 import { updateProviderTokens } from "../config/store.js";
 import { DEFAULT_REDIRECT_URI, waitForOAuthCode } from "../oauth/server.js";
-import type { CloudProvider, PutObjectInput, PutObjectResult } from "./types.js";
+import type {
+  CloudProvider,
+  GetObjectResult,
+  PutObjectInput,
+  PutObjectResult,
+} from "./types.js";
 
 const SCOPES = ["Files.ReadWrite", "offline_access", "openid", "profile"].join(
   " ",
@@ -227,6 +232,24 @@ export class OneDriveProvider implements CloudProvider {
     return {
       remotePath: input.remotePath,
       destination: `onedrive:///${remotePath}`,
+    };
+  }
+
+  async getObject(remotePath: string): Promise<GetObjectResult> {
+    const accessToken = await this.ensureAccessToken();
+    const path = remotePath.replace(/^\/+/, "");
+    const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURI(path)}:/content`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) {
+      throw new Error(`OneDrive download failed: ${await res.text()}`);
+    }
+    const body = Buffer.from(await res.arrayBuffer());
+    return {
+      body,
+      size: body.length,
+      contentType: res.headers.get("content-type") ?? undefined,
     };
   }
 }

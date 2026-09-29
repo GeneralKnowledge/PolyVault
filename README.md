@@ -1,14 +1,23 @@
 # PolyVault
 
-Upload a file **once**; store it on **multiple free cloud providers** in parallel.
+Upload a file **once** to a primary hub; it then **replicates** to your other linked clouds.
 
 ```bash
 polyvault put ./hello.txt
 ```
 
-`hello.txt` appears in every **distinct** linked destination (local folders, S3-compatible, Google Drive, OneDrive) under a shared remote folder (default `PolyVault/`).
+`hello.txt` ends up in every linked destination (local folders, S3-compatible, Google Drive, OneDrive) under a shared remote folder (default `PolyVault/`).
 
-One `polyvault put` reads the local file and fans out in parallel — you do not run upload once per cloud. V1 still uses your network once per destination (cloud-to-cloud relay is roadmap). PolyVault refuses a put if two linked providers resolve to the same destination, so you cannot accidentally upload the same file twice to one place.
+## How put works (important)
+
+PolyVault does **not** upload your original file separately to each cloud.
+
+1. **Upload once** — the original is sent only to the **primary hub** provider.
+2. **Replicate** — every other provider receives a copy **from the hub**, not another upload of the original source file.
+
+The first provider you link becomes the primary hub (override with `provider add --primary`, `provider set-primary`, or `put --primary`).
+
+Until a cloud-to-cloud relay VM exists, replica hops may still transit this machine (download from hub → upload to replica). The original source file is still only uploaded once.
 
 ## Requirements
 
@@ -38,26 +47,26 @@ Config lives in `~/.polyvault/` (override with `POLYVAULT_HOME`). Secrets are st
 polyvault init
 
 mkdir -p /tmp/pv-a /tmp/pv-b
-polyvault provider add local --name a --path /tmp/pv-a
-polyvault provider add local --name b --path /tmp/pv-b
+polyvault provider add local --name a --path /tmp/pv-a   # becomes primary hub
+polyvault provider add local --name b --path /tmp/pv-b   # replica
 
 echo 'hi' > hello.txt
 polyvault put hello.txt
 
-# → /tmp/pv-a/PolyVault/hello.txt
-# → /tmp/pv-b/PolyVault/hello.txt
+# original → /tmp/pv-a/PolyVault/hello.txt  (primary)
+# hub copy → /tmp/pv-b/PolyVault/hello.txt  (replica)
 
 polyvault status
 polyvault provider list
 ```
 
-Partial failure (one bad destination) still uploads to the others and exits non-zero:
+Partial failure: if the primary succeeds but a replica fails, other replicas can still succeed; exit code is non-zero.
 
 ```bash
 polyvault provider add local --name bad --path /tmp/this-is-a-file/nested
 # (create a file at /tmp/this-is-a-file first)
 polyvault put hello.txt
-# ✓ a  ✓ b  ✗ bad   exit code 1
+# ✓ primary a  ✓ replica b  ✗ replica bad   exit code 1
 ```
 
 ## Commands
@@ -66,14 +75,16 @@ polyvault put hello.txt
 |---------|-------------|
 | `polyvault init` | Create config under `~/.polyvault/` |
 | `polyvault provider add <kind>` | Link a provider (`local`, `s3`, `gdrive`, `onedrive`) |
+| `polyvault provider set-primary <name>` | Choose which provider receives the original upload |
 | `polyvault provider list` | List linked providers |
-| `polyvault put <file>` | Upload to all providers (or `--to name1,name2`) |
+| `polyvault put <file>` | Upload once to primary, replicate to others |
 | `polyvault status` | Show providers + last put result |
 
 `put` options:
 
 - `--remote-dir <dir>` — remote folder (default `PolyVault`)
 - `--to <names>` — comma-separated provider names
+- `--primary <name>` — override hub for this put
 
 ## S3-compatible (Cloudflare R2 / Backblaze B2 / MinIO)
 
@@ -84,7 +95,8 @@ polyvault provider add s3 \
   --region auto \
   --bucket my-polyvault \
   --access-key-id <KEY> \
-  --secret-access-key <SECRET>
+  --secret-access-key <SECRET> \
+  --primary
 ```
 
 **Backblaze B2** (S3-compatible API):
@@ -158,7 +170,7 @@ echo 'hello from polyvault' > hello.txt
 polyvault put hello.txt --remote-dir PolyVault
 ```
 
-Every linked provider receives `PolyVault/hello.txt`. Failures are isolated: other destinations still succeed; the CLI prints a per-provider summary and exits `1` if any failed.
+Original uploads once to the primary hub; replicas are filled from that hub copy.
 
 ## Environment
 
@@ -181,9 +193,9 @@ test/
 
 ## Roadmap
 
+- **Cloud-to-cloud relay VM** — push replicas from the hub without pulling bytes back through your laptop.
 - **Encryption** — client-side encrypt before upload; decrypt on download (not in v1).
 - **More providers** — Dropbox, Mega, WebDAV.
-- **Cloud-to-cloud relay** — optional VM that copies between clouds without re-uploading from your laptop (out of scope for v1).
 - Folder backup / incremental sync / manifests.
 
 ## License

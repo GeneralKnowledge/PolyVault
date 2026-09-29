@@ -3,7 +3,12 @@ import { Readable } from "node:stream";
 import type { GDriveProviderConfig } from "../config/types.js";
 import { updateProviderTokens } from "../config/store.js";
 import { DEFAULT_REDIRECT_URI, waitForOAuthCode } from "../oauth/server.js";
-import type { CloudProvider, PutObjectInput, PutObjectResult } from "./types.js";
+import type {
+  CloudProvider,
+  GetObjectResult,
+  PutObjectInput,
+  PutObjectResult,
+} from "./types.js";
 
 const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -268,6 +273,77 @@ export class GDriveProvider implements CloudProvider {
     return {
       remotePath: input.remotePath,
       destination: `gdrive://${input.remotePath}`,
+    };
+  }
+
+  private async findFolder(
+    accessToken: string,
+    parentId: string,
+    name: string,
+  ): Promise<string | null> {
+    const q = encodeURIComponent(
+      `name='${name.replace(/'/g, "\\'")}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+    );
+    const listRes = await fetch(
+      `${DRIVE_API}?q=${q}&fields=files(id,name)&spaces=drive`,
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+    );
+    if (!listRes.ok) {
+      throw new Error(`Drive folder lookup failed: ${await listRes.text()}`);
+    }
+    const listed = (await listRes.json()) as { files?: Array<{ id: string }> };
+    return listed.files?.[0]?.id ?? null;
+  }
+
+  private async findFileId(
+    accessToken: string,
+    remotePath: string,
+  ): Promise<string> {
+    const parts = remotePath.split("/").filter(Boolean);
+    const fileName = parts.pop();
+    if (!fileName) throw new Error("Invalid remote path");
+
+    let parentId = "root";
+    for (const part of parts) {
+      const next = await this.findFolder(accessToken, parentId, part);
+      if (!next) {
+        throw new Error(`Google Drive folder not found: ${part}`);
+      }
+      parentId = next;
+    }
+
+    const q = encodeURIComponent(
+      `name='${fileName.replace(/'/g, "\\'")}' and '${parentId}' in parents and trashed=false`,
+    );
+    const listRes = await fetch(
+      `${DRIVE_API}?q=${q}&fields=files(id)&spaces=drive`,
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+    );
+    if (!listRes.ok) {
+      throw new Error(`Drive file lookup failed: ${await listRes.text()}`);
+    }
+    const listed = (await listRes.json()) as { files?: Array<{ id: string }> };
+    const id = listed.files?.[0]?.id;
+    if (!id) {
+      throw new Error(`Google Drive file not found: ${remotePath}`);
+    }
+    return id;
+  }
+
+  async getObject(remotePath: string): Promise<GetObjectResult> {
+    const accessToken = await this.ensureAccessToken();
+    const fileId = await this.findFileId(accessToken, remotePath);
+    const res = await fetch(`${DRIVE_API}/${fileId}?alt=media`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) {
+      throw new Error(`Google Drive download failed: ${await res.text()}`);
+    }
+    const body = Buffer.from(await res.arrayBuffer());
+    return {
+      body,
+      size: body.length,
+      contentType: res.headers.get("content-type") ?? undefined,
     };
   }
 }

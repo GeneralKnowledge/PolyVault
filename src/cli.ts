@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { runInit } from "./commands/init.js";
-import { runProviderAdd, runProviderList } from "./commands/provider.js";
+import {
+  runProviderAdd,
+  runProviderList,
+  runProviderSetPrimary,
+} from "./commands/provider.js";
 import { runPut } from "./commands/put.js";
 import { runStatus } from "./commands/status.js";
 
@@ -10,7 +14,7 @@ const program = new Command();
 program
   .name("polyvault")
   .description(
-    "Upload a file once; store it on multiple free cloud providers in parallel.",
+    "Upload a file once to a primary hub; replicate to other linked clouds.",
   )
   .version("0.1.0");
 
@@ -48,6 +52,7 @@ provider
   .option("--client-id <id>", "OAuth client ID (gdrive/onedrive)")
   .option("--client-secret <secret>", "OAuth client secret")
   .option("--tenant <tenant>", "Microsoft tenant (onedrive)", "common")
+  .option("--primary", "Make this provider the upload hub")
   .action(
     async (
       kind: string,
@@ -63,25 +68,37 @@ provider
         clientId?: string;
         clientSecret?: string;
         tenant?: string;
+        primary?: boolean;
       },
     ) => {
       await runProviderAdd(kind, opts);
     },
   );
 
+provider
+  .command("set-primary")
+  .description("Choose which provider receives the original upload")
+  .argument("<name>", "Provider name")
+  .action(async (name: string) => {
+    await runProviderSetPrimary(name);
+  });
+
 program
   .command("put")
-  .description("Upload a file to all (or selected) linked providers")
+  .description(
+    "Upload the original once to the primary hub, then replicate to other providers",
+  )
   .argument("<file>", "Local file to upload")
   .option("--to <names>", "Comma-separated provider names")
   .option(
     "--remote-dir <dir>",
     "Remote folder (default: PolyVault from config)",
   )
+  .option("--primary <name>", "Override primary hub for this put")
   .action(
     async (
       file: string,
-      opts: { to?: string; remoteDir?: string },
+      opts: { to?: string; remoteDir?: string; primary?: string },
     ) => {
       const outcomes = await runPut(file, opts);
       if (outcomes.some((o) => !o.ok)) {
