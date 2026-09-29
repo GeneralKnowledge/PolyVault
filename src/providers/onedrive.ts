@@ -252,4 +252,103 @@ export class OneDriveProvider implements CloudProvider {
       contentType: res.headers.get("content-type") ?? undefined,
     };
   }
+
+  /**
+   * OneDrive Personal preview: Microsoft pulls bytes from sourceUrl (e.g. R2
+   * presigned GET). Does not send the original through the laptop.
+   */
+  async putFromUrl(
+    remotePath: string,
+    sourceUrl: string,
+  ): Promise<PutObjectResult> {
+    const accessToken = await this.ensureAccessToken();
+    const parts = remotePath.replace(/^\/+/, "").split("/").filter(Boolean);
+    const fileName = parts.pop();
+    if (!fileName) throw new Error("Invalid remote path");
+
+    let parentId = "root";
+    for (const part of parts) {
+      parentId = await this.findOrCreateChildFolder(accessToken, parentId, part);
+    }
+
+    const res = await fetch(
+      `https://graph.microsoft.com/v1.0/me/drive/items/${parentId}/children`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          Prefer: "respond-async",
+        },
+        body: JSON.stringify({
+          "@microsoft.graph.sourceUrl": sourceUrl,
+          "@microsoft.graph.conflictBehavior": "replace",
+          name: fileName,
+          file: {},
+        }),
+      },
+    );
+
+    if (!res.ok && res.status !== 202) {
+      throw new Error(
+        `OneDrive URL pull failed (Personal preview API): ${await res.text()}`,
+      );
+    }
+
+    return {
+      remotePath,
+      destination: `onedrive:///${remotePath} (url-pull)`,
+    };
+  }
+
+  private async findOrCreateChildFolder(
+    accessToken: string,
+    parentId: string,
+    name: string,
+  ): Promise<string> {
+    const listRes = await fetch(
+      `https://graph.microsoft.com/v1.0/me/drive/items/${parentId}/children?$filter=name eq '${name.replace(/'/g, "''")}'`,
+      { headers: { Authorization: `Bearer ${accessToken}` } },
+    );
+    if (listRes.ok) {
+      const listed = (await listRes.json()) as {
+        value?: Array<{ id: string; folder?: unknown }>;
+      };
+      const existing = listed.value?.find((v) => v.folder !== undefined);
+      if (existing) return existing.id;
+    }
+
+    const createRes = await fetch(
+      `https://graph.microsoft.com/v1.0/me/drive/items/${parentId}/children`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          name,
+          folder: {},
+          "@microsoft.graph.conflictBehavior": "fail",
+        }),
+      },
+    );
+    if (!createRes.ok) {
+      // race: folder may already exist
+      const retry = await fetch(
+        `https://graph.microsoft.com/v1.0/me/drive/items/${parentId}/children?$filter=name eq '${name.replace(/'/g, "''")}'`,
+        { headers: { Authorization: `Bearer ${accessToken}` } },
+      );
+      if (retry.ok) {
+        const listed = (await retry.json()) as {
+          value?: Array<{ id: string; folder?: unknown }>;
+        };
+        const existing = listed.value?.find((v) => v.folder !== undefined);
+        if (existing) return existing.id;
+      }
+      throw new Error(`OneDrive folder create failed: ${await createRes.text()}`);
+    }
+    const created = (await createRes.json()) as { id: string };
+    return created.id;
+  }
 }

@@ -1,18 +1,22 @@
 {
   "name": "polyvault",
-  "version": "0.1.0",
-  "description": "Upload a file once; store it on multiple free cloud providers in parallel.",
+  "version": "0.2.0",
+  "description": "Upload once to a free R2 hub; replicate to Drive/OneDrive via URL-pull or free relay.",
   "type": "module",
   "bin": {
     "polyvault": "./dist/cli.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
+    "relay": "tsx src/relay/main.ts",
+    "relay:prod": "node dist/relay/main.js",
     "test": "tsx --test test/**/*.test.ts",
     "prepublishOnly": "npm run build"
   },
@@ -23,13 +27,16 @@
     "cli",
     "cloud",
     "upload",
+    "r2",
     "s3",
     "google-drive",
-    "onedrive"
+    "onedrive",
+    "relay"
   ],
   "license": "MIT",
   "dependencies": {
     "@aws-sdk/client-s3": "^3.758.0",
+    "@aws-sdk/s3-request-presigner": "^3.758.0",
     "commander": "^13.1.0",
     "open": "^10.1.0"
   },

@@ -1,14 +1,18 @@
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import {
+  allProviders,
   createDefaultConfig,
+  migrateConfig,
+  type LegacyPolyVaultConfig,
   type PolyVaultConfig,
   type ProviderConfig,
   type PutResultRecord,
+  type RelayConfig,
 } from "./types.js";
 import { getConfigPath, getPolyVaultHome, getSecretsPath } from "./paths.js";
 
-/** Secrets that should live in secrets.json (mode 0600), keyed by provider name. */
+/** Secrets keyed by provider name, plus optional `_relay`. */
 export type SecretsStore = Record<string, Record<string, string>>;
 
 async function ensureHome(): Promise<string> {
@@ -17,7 +21,7 @@ async function ensureHome(): Promise<string> {
   try {
     await chmod(home, 0o700);
   } catch {
-    // best-effort on platforms that ignore mode
+    // best-effort
   }
   return home;
 }
@@ -47,10 +51,7 @@ function stripSecrets(provider: ProviderConfig): {
     }
     case "gdrive": {
       const { clientSecret, refreshToken, accessToken, ...rest } = provider;
-      const secrets: Record<string, string> = {
-        clientSecret,
-        refreshToken,
-      };
+      const secrets: Record<string, string> = { clientSecret, refreshToken };
       if (accessToken) secrets.accessToken = accessToken;
       return {
         public: {
@@ -64,10 +65,7 @@ function stripSecrets(provider: ProviderConfig): {
     }
     case "onedrive": {
       const { clientSecret, refreshToken, accessToken, ...rest } = provider;
-      const secrets: Record<string, string> = {
-        clientSecret,
-        refreshToken,
-      };
+      const secrets: Record<string, string> = { clientSecret, refreshToken };
       if (accessToken) secrets.accessToken = accessToken;
       return {
         public: {
@@ -125,8 +123,10 @@ export async function loadConfig(): Promise<PolyVaultConfig> {
     );
   }
 
-  const raw = await readFile(configPath, "utf8");
-  const config = JSON.parse(raw) as PolyVaultConfig;
+  const rawJson = JSON.parse(await readFile(configPath, "utf8")) as
+    | PolyVaultConfig
+    | LegacyPolyVaultConfig;
+  const config = migrateConfig(rawJson);
 
   let secrets: SecretsStore = {};
   const secretsPath = getSecretsPath();
@@ -134,29 +134,51 @@ export async function loadConfig(): Promise<PolyVaultConfig> {
     secrets = JSON.parse(await readFile(secretsPath, "utf8")) as SecretsStore;
   }
 
-  return {
-    ...config,
-    providers: config.providers.map((p) => mergeSecrets(p, secrets[p.name])),
-  };
+  const hub = config.hub
+    ? mergeSecrets(config.hub, secrets[config.hub.name])
+    : undefined;
+  const replicas = config.replicas.map((p) => mergeSecrets(p, secrets[p.name]));
+  const relay: RelayConfig | undefined = config.relay
+    ? {
+        url: config.relay.url,
+        token: secrets._relay?.token ?? config.relay.token,
+      }
+    : undefined;
+
+  return { ...config, hub, replicas, relay };
 }
 
 export async function saveConfig(config: PolyVaultConfig): Promise<void> {
   await ensureHome();
 
   const secrets: SecretsStore = {};
-  const publicProviders: ProviderConfig[] = [];
+  let publicHub: ProviderConfig | undefined;
+  if (config.hub) {
+    const { public: pub, secrets: sec } = stripSecrets(config.hub);
+    publicHub = pub;
+    if (Object.keys(sec).length > 0) secrets[config.hub.name] = sec;
+  }
 
-  for (const provider of config.providers) {
+  const publicReplicas: ProviderConfig[] = [];
+  for (const provider of config.replicas) {
     const { public: pub, secrets: sec } = stripSecrets(provider);
-    publicProviders.push(pub);
-    if (Object.keys(sec).length > 0) {
-      secrets[provider.name] = sec;
-    }
+    publicReplicas.push(pub);
+    if (Object.keys(sec).length > 0) secrets[provider.name] = sec;
+  }
+
+  if (config.relay?.token) {
+    secrets._relay = { token: config.relay.token };
   }
 
   const publicConfig: PolyVaultConfig = {
-    ...config,
-    providers: publicProviders,
+    version: 2,
+    defaultRemoteDir: config.defaultRemoteDir,
+    hub: publicHub,
+    replicas: publicReplicas,
+    relay: config.relay
+      ? { url: config.relay.url }
+      : undefined,
+    lastPut: config.lastPut,
   };
 
   await writeRestricted(getConfigPath(), JSON.stringify(publicConfig, null, 2) + "\n");
@@ -175,25 +197,52 @@ export async function initConfig(force = false): Promise<PolyVaultConfig> {
   return config;
 }
 
-export async function addProvider(provider: ProviderConfig): Promise<void> {
+export async function setHub(provider: ProviderConfig): Promise<void> {
   const config = await loadConfig();
-  if (config.providers.some((p) => p.name === provider.name)) {
-    throw new Error(`Provider "${provider.name}" already exists.`);
+  if (config.replicas.some((p) => p.name === provider.name)) {
+    throw new Error(
+      `"${provider.name}" is already a replica. Choose a different name for the hub.`,
+    );
   }
-  config.providers.push(provider);
-  // First linked provider becomes the hub that receives the original upload.
-  if (!config.primaryProvider) {
-    config.primaryProvider = provider.name;
-  }
+  // If replacing hub, keep old hub out of replicas unless user re-adds it.
+  config.hub = provider;
   await saveConfig(config);
 }
 
-export async function setPrimaryProvider(name: string): Promise<void> {
+export async function addReplica(provider: ProviderConfig): Promise<void> {
   const config = await loadConfig();
-  if (!config.providers.some((p) => p.name === name)) {
-    throw new Error(`Provider "${name}" not found.`);
+  if (config.hub?.name === provider.name) {
+    throw new Error(`"${provider.name}" is already the hub.`);
   }
-  config.primaryProvider = name;
+  if (config.replicas.some((p) => p.name === provider.name)) {
+    throw new Error(`Replica "${provider.name}" already exists.`);
+  }
+  config.replicas.push(provider);
+  await saveConfig(config);
+}
+
+/** @deprecated Prefer setHub / addReplica. Kept for migration helpers. */
+export async function addProvider(
+  provider: ProviderConfig,
+  asHub = false,
+): Promise<void> {
+  const config = await loadConfig();
+  if (!config.hub || asHub) {
+    await setHub(provider);
+    return;
+  }
+  await addReplica(provider);
+}
+
+export async function setRelay(relay: RelayConfig): Promise<void> {
+  const config = await loadConfig();
+  config.relay = relay;
+  await saveConfig(config);
+}
+
+export async function clearRelay(): Promise<void> {
+  const config = await loadConfig();
+  config.relay = undefined;
   await saveConfig(config);
 }
 
@@ -206,16 +255,21 @@ export async function updateProviderTokens(
   },
 ): Promise<void> {
   const config = await loadConfig();
-  const idx = config.providers.findIndex((p) => p.name === name);
-  if (idx < 0) throw new Error(`Provider "${name}" not found.`);
-  const provider = config.providers[idx]!;
-  if (provider.kind !== "gdrive" && provider.kind !== "onedrive") {
-    throw new Error(`Provider "${name}" does not use OAuth tokens.`);
-  }
-  config.providers[idx] = {
-    ...provider,
-    ...tokens,
+  const patch = (p: ProviderConfig): ProviderConfig => {
+    if (p.name !== name) return p;
+    if (p.kind !== "gdrive" && p.kind !== "onedrive") {
+      throw new Error(`Provider "${name}" does not use OAuth tokens.`);
+    }
+    return { ...p, ...tokens };
   };
+
+  if (config.hub?.name === name) {
+    config.hub = patch(config.hub);
+  } else {
+    const idx = config.replicas.findIndex((p) => p.name === name);
+    if (idx < 0) throw new Error(`Provider "${name}" not found.`);
+    config.replicas[idx] = patch(config.replicas[idx]!);
+  }
   await saveConfig(config);
 }
 
@@ -224,3 +278,14 @@ export async function recordLastPut(record: PutResultRecord): Promise<void> {
   config.lastPut = record;
   await saveConfig(config);
 }
+
+export function requireHub(config: PolyVaultConfig): ProviderConfig {
+  if (!config.hub) {
+    throw new Error(
+      "No hub configured. Set a free R2/S3 hub with `polyvault hub set s3` (or `hub set local` for tests).",
+    );
+  }
+  return config.hub;
+}
+
+export { allProviders };

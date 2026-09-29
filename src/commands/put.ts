@@ -1,41 +1,35 @@
 import { createReadStream } from "node:fs";
 import { copyFile, mkdir, realpath, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { loadConfig, recordLastPut } from "../config/store.js";
-import type { ProviderConfig, ProviderKind } from "../config/types.js";
-import { createProvider, LocalProvider } from "../providers/index.js";
+import { loadConfig, recordLastPut, requireHub } from "../config/store.js";
+import type {
+  ProviderConfig,
+  ProviderKind,
+  ReplicateMode,
+} from "../config/types.js";
+import { createProvider, LocalProvider, S3Provider } from "../providers/index.js";
 import type { CloudProvider } from "../providers/types.js";
+import { OneDriveProvider } from "../providers/onedrive.js";
+import { replicateViaRelay } from "../relay/client.js";
 import { buildRemotePath } from "../util/path.js";
 
 export interface PutOptions {
   to?: string;
   remoteDir?: string;
-  /** Override which provider receives the original upload. */
-  primary?: string;
+  /** Force laptop-bridge even when relay/URL-pull is available (debug). */
+  bridge?: boolean;
 }
 
 export interface ProviderPutOutcome {
   name: string;
   kind: ProviderKind;
-  role: "primary" | "replica";
+  role: "hub" | "replica";
+  mode: ReplicateMode;
   ok: boolean;
   remotePath?: string;
   destination?: string;
   error?: string;
   ms: number;
-}
-
-function selectProviders(
-  all: ProviderConfig[],
-  to?: string,
-): ProviderConfig[] {
-  if (!to) return all;
-  const names = to.split(",").map((s) => s.trim()).filter(Boolean);
-  const missing = names.filter((n) => !all.some((p) => p.name === n));
-  if (missing.length > 0) {
-    throw new Error(`Unknown provider(s): ${missing.join(", ")}`);
-  }
-  return all.filter((p) => names.includes(p.name));
 }
 
 async function resolveLocalRoot(path: string): Promise<string> {
@@ -46,66 +40,52 @@ async function resolveLocalRoot(path: string): Promise<string> {
   }
 }
 
-async function assertDistinctDestinations(
-  targets: ProviderConfig[],
+async function assertDistinctFromHub(
+  hub: ProviderConfig,
+  replicas: ProviderConfig[],
 ): Promise<void> {
-  const seen = new Map<string, string>();
-  for (const t of targets) {
-    let key: string;
-    switch (t.kind) {
-      case "local":
-        key = `local:${await resolveLocalRoot(t.path)}`;
-        break;
-      case "s3":
-        key = `s3:${t.endpoint}|${t.bucket}`;
-        break;
-      case "gdrive":
-        key = `gdrive:${t.clientId}|${t.refreshToken.slice(0, 12)}`;
-        break;
-      case "onedrive":
-        key = `onedrive:${t.clientId}|${t.refreshToken.slice(0, 12)}`;
-        break;
-    }
-    const prior = seen.get(key);
-    if (prior) {
+  const hubKey =
+    hub.kind === "local"
+      ? `local:${await resolveLocalRoot(hub.path)}`
+      : hub.kind === "s3"
+        ? `s3:${hub.endpoint}|${hub.bucket}`
+        : `${hub.kind}:${hub.name}`;
+
+  for (const t of replicas) {
+    const key =
+      t.kind === "local"
+        ? `local:${await resolveLocalRoot(t.path)}`
+        : t.kind === "s3"
+          ? `s3:${t.endpoint}|${t.bucket}`
+          : `${t.kind}:${t.name}`;
+    if (key === hubKey) {
       throw new Error(
-        `Providers "${prior}" and "${t.name}" point at the same destination.`,
+        `Replica "${t.name}" points at the same place as hub "${hub.name}".`,
       );
     }
-    seen.set(key, t.name);
   }
 }
 
-function pickPrimary(
-  targets: ProviderConfig[],
-  preferred?: string,
-): ProviderConfig {
-  if (preferred) {
-    const found = targets.find((t) => t.name === preferred);
-    if (!found) {
-      throw new Error(
-        `Primary provider "${preferred}" is not in the put target list.`,
-      );
-    }
-    return found;
-  }
-  return targets[0]!;
+async function copyLocalHubToLocalReplica(
+  hub: LocalProvider,
+  replica: LocalProvider,
+  remotePath: string,
+): Promise<{ remotePath: string; destination: string }> {
+  const src = hub.resolveAbsolute(remotePath);
+  const dest = replica.resolveAbsolute(remotePath);
+  await mkdir(dirname(dest), { recursive: true });
+  await copyFile(src, dest);
+  return { remotePath, destination: dest };
 }
 
-async function replicateFromHub(
+async function laptopBridge(
   hub: CloudProvider,
   replica: CloudProvider,
   remotePath: string,
 ): Promise<{ remotePath: string; destination: string }> {
-  // Fast path: local → local copy from the hub file (never re-reads the original).
   if (hub instanceof LocalProvider && replica instanceof LocalProvider) {
-    const src = hub.resolveAbsolute(remotePath);
-    const dest = replica.resolveAbsolute(remotePath);
-    await mkdir(dirname(dest), { recursive: true });
-    await copyFile(src, dest);
-    return { remotePath, destination: dest };
+    return copyLocalHubToLocalReplica(hub, replica, remotePath);
   }
-
   const object = await hub.getObject(remotePath);
   return replica.putObject({
     remotePath,
@@ -115,14 +95,27 @@ async function replicateFromHub(
   });
 }
 
+function selectReplicas(
+  all: ProviderConfig[],
+  to?: string,
+): ProviderConfig[] {
+  if (!to) return all;
+  const names = to.split(",").map((s) => s.trim()).filter(Boolean);
+  const missing = names.filter((n) => !all.some((p) => p.name === n));
+  if (missing.length > 0) {
+    throw new Error(`Unknown replica(s): ${missing.join(", ")}`);
+  }
+  return all.filter((p) => names.includes(p.name));
+}
+
 export async function runPut(
   fileArg: string,
   options: PutOptions,
 ): Promise<ProviderPutOutcome[]> {
   const config = await loadConfig();
-  if (config.providers.length === 0) {
-    throw new Error("No providers configured. Add one with `polyvault provider add`.");
-  }
+  const hubConfig = requireHub(config);
+  const replicas = selectReplicas(config.replicas, options.to);
+  await assertDistinctFromHub(hubConfig, replicas);
 
   const filePath = resolve(fileArg);
   const fileStat = await stat(filePath);
@@ -130,85 +123,79 @@ export async function runPut(
     throw new Error(`Not a file: ${filePath}`);
   }
 
-  const targets = selectProviders(config.providers, options.to);
-  if (targets.length === 0) {
-    throw new Error("No matching providers to upload to.");
-  }
-
-  await assertDistinctDestinations(targets);
-
-  const primaryConfig = pickPrimary(
-    targets,
-    options.primary ?? config.primaryProvider,
-  );
-  const replicas = targets.filter((t) => t.name !== primaryConfig.name);
-
   const remoteDir = options.remoteDir ?? config.defaultRemoteDir;
   const remotePath = buildRemotePath(remoteDir, filePath);
   const size = fileStat.size;
 
-  console.log(`Source: ${filePath}`);
-  console.log(`Remote path: ${remotePath}`);
+  const hubRecommended =
+    hubConfig.kind === "s3"
+      ? "R2/S3 hub"
+      : "local hub (tests only — use R2 for free cloud hub)";
+
+  console.log(`Source:     ${filePath}`);
+  console.log(`Remote:     ${remotePath}`);
   console.log(
-    `Upload once → primary "${primaryConfig.name}" [${primaryConfig.kind}]`,
+    `Hub:        ${hubConfig.name} [${hubConfig.kind}] — ${hubRecommended}`,
   );
-  if (replicas.length > 0) {
+  console.log(
+    `Replicas:   ${replicas.length ? replicas.map((r) => r.name).join(", ") : "(none)"}`,
+  );
+  if (config.relay?.url) {
+    console.log(`Relay:      ${config.relay.url}`);
+  } else {
     console.log(
-      `Then replicate hub → ${replicas.map((r) => r.name).join(", ")}`,
+      `Relay:      (not set — cloud replicas may use URL-pull or laptop-bridge)`,
     );
   }
   console.log("");
 
   const outcomes: ProviderPutOutcome[] = [];
+  const hubProvider = createProvider(hubConfig);
 
-  // 1) Upload the original exactly once, to the primary hub.
-  const primaryStarted = Date.now();
-  const primaryProvider = createProvider(primaryConfig);
+  // 1) Upload original once to the free hub.
+  const hubStarted = Date.now();
   try {
-    const result = await primaryProvider.putObject({
+    const result = await hubProvider.putObject({
       remotePath,
       body: createReadStream(filePath),
       size,
     });
     outcomes.push({
-      name: primaryConfig.name,
-      kind: primaryConfig.kind,
-      role: "primary",
+      name: hubConfig.name,
+      kind: hubConfig.kind,
+      role: "hub",
+      mode: "hub-upload",
       ok: true,
       remotePath: result.remotePath,
       destination: result.destination,
-      ms: Date.now() - primaryStarted,
+      ms: Date.now() - hubStarted,
     });
-    console.log(
-      `  ✓ primary ${primaryConfig.name} ← original upload (${outcomes[0]!.ms}ms)`,
-    );
+    console.log(`  ✓ hub ${hubConfig.name} ← original upload (${outcomes[0]!.ms}ms)`);
     console.log(`      ${result.destination}`);
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     outcomes.push({
-      name: primaryConfig.name,
-      kind: primaryConfig.kind,
-      role: "primary",
+      name: hubConfig.name,
+      kind: hubConfig.kind,
+      role: "hub",
+      mode: "hub-upload",
       ok: false,
       error,
-      ms: Date.now() - primaryStarted,
+      ms: Date.now() - hubStarted,
     });
-    console.log(`  ✗ primary ${primaryConfig.name} FAILED`);
+    console.log(`  ✗ hub ${hubConfig.name} FAILED`);
     console.log(`      ${error}`);
-    console.log(
-      "\nPrimary upload failed — original was not uploaded; skipping replication.",
-    );
-
     await recordLastPut({
       at: new Date().toISOString(),
       file: filePath,
       remoteDir,
-      primary: primaryConfig.name,
+      hub: hubConfig.name,
       results: outcomes.map((o) => ({
         name: o.name,
         kind: o.kind,
         ok: o.ok,
         role: o.role,
+        mode: o.mode,
         remotePath: o.remotePath,
         destination: o.destination,
         error: o.error,
@@ -217,71 +204,127 @@ export async function runPut(
     return outcomes;
   }
 
-  // 2) Replicate from the hub copy — do not re-upload the original source.
-  if (replicas.length > 0) {
-    console.log("");
-    const replicaOutcomes = await Promise.all(
-      replicas.map(async (replicaConfig): Promise<ProviderPutOutcome> => {
-        const started = Date.now();
-        try {
-          const replica = createProvider(replicaConfig);
-          const result = await replicateFromHub(
-            primaryProvider,
-            replica,
-            remotePath,
-          );
-          return {
-            name: replicaConfig.name,
-            kind: replicaConfig.kind,
-            role: "replica",
-            ok: true,
-            remotePath: result.remotePath,
-            destination: result.destination,
-            ms: Date.now() - started,
-          };
-        } catch (err) {
-          return {
-            name: replicaConfig.name,
-            kind: replicaConfig.kind,
-            role: "replica",
-            ok: false,
-            error: err instanceof Error ? err.message : String(err),
-            ms: Date.now() - started,
-          };
-        }
-      }),
-    );
-    outcomes.push(...replicaOutcomes);
+  // Presigned GET from R2/S3 hub for URL-pull / relay.
+  let signedGetUrl: string | undefined;
+  if (hubProvider instanceof S3Provider) {
+    try {
+      signedGetUrl = await hubProvider.getSignedGetUrl(remotePath, 3600);
+    } catch (err) {
+      console.warn(
+        `  ! could not create hub signed URL: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
 
-    for (const o of replicaOutcomes) {
-      if (o.ok) {
-        console.log(
-          `  ✓ replica ${o.name} ← from hub (${o.ms}ms)`,
+  // 2) Fill replicas from the hub — never re-upload the original source.
+  for (const replicaConfig of replicas) {
+    const started = Date.now();
+    let mode: ReplicateMode = "laptop-bridge";
+    try {
+      const replica = createProvider(replicaConfig);
+      let destination: string;
+      let remote = remotePath;
+
+      const canRelay =
+        !options.bridge &&
+        config.relay?.url &&
+        config.relay.token &&
+        signedGetUrl &&
+        (replicaConfig.kind === "gdrive" ||
+          replicaConfig.kind === "onedrive" ||
+          replicaConfig.kind === "s3");
+
+      if (canRelay) {
+        mode = "relay";
+        const relayResult = await replicateViaRelay(config.relay!, {
+          sourceUrl: signedGetUrl!,
+          remotePath,
+          size,
+          destination: replicaConfig,
+        });
+        destination = relayResult.destination ?? `relay://${replicaConfig.name}`;
+      } else if (
+        !options.bridge &&
+        replica instanceof OneDriveProvider &&
+        signedGetUrl
+      ) {
+        mode = "onedrive-url-pull";
+        const result = await replica.putFromUrl(remotePath, signedGetUrl);
+        destination = result.destination;
+        remote = result.remotePath;
+      } else if (
+        hubProvider instanceof LocalProvider &&
+        replica instanceof LocalProvider
+      ) {
+        mode = "hub-copy";
+        const result = await copyLocalHubToLocalReplica(
+          hubProvider,
+          replica,
+          remotePath,
         );
-        console.log(`      ${o.destination}`);
+        destination = result.destination;
       } else {
-        console.log(`  ✗ replica ${o.name} FAILED (${o.ms}ms)`);
-        console.log(`      ${o.error}`);
+        mode = "laptop-bridge";
+        if (
+          replicaConfig.kind === "gdrive" ||
+          replicaConfig.kind === "onedrive"
+        ) {
+          console.log(
+            `  … ${replicaConfig.name}: no relay/URL-pull — bridging via this machine (hub→laptop→cloud)`,
+          );
+        }
+        const result = await laptopBridge(hubProvider, replica, remotePath);
+        destination = result.destination;
+        remote = result.remotePath;
       }
+
+      outcomes.push({
+        name: replicaConfig.name,
+        kind: replicaConfig.kind,
+        role: "replica",
+        mode,
+        ok: true,
+        remotePath: remote,
+        destination,
+        ms: Date.now() - started,
+      });
+      console.log(
+        `  ✓ replica ${replicaConfig.name} ← ${mode} (${Date.now() - started}ms)`,
+      );
+      console.log(`      ${destination}`);
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      outcomes.push({
+        name: replicaConfig.name,
+        kind: replicaConfig.kind,
+        role: "replica",
+        mode,
+        ok: false,
+        error,
+        ms: Date.now() - started,
+      });
+      console.log(`  ✗ replica ${replicaConfig.name} FAILED (${mode})`);
+      console.log(`      ${error}`);
     }
   }
 
   const okCount = outcomes.filter((o) => o.ok).length;
   const failCount = outcomes.length - okCount;
   console.log(
-    `\nDone: original uploaded once to primary; ${okCount} place(s) have the file, ${failCount} failed`,
+    `\nDone: original uploaded once to hub; ${okCount} place(s) OK, ${failCount} failed`,
   );
 
   await recordLastPut({
     at: new Date().toISOString(),
     file: filePath,
     remoteDir,
-    primary: primaryConfig.name,
+    hub: hubConfig.name,
     results: outcomes.map((o) => ({
       name: o.name,
       kind: o.kind,
       ok: o.ok,
       role: o.role,
+      mode: o.mode,
       remotePath: o.remotePath,
       destination: o.destination,
       error: o.error,

@@ -26,4 +26,9 @@ export { LocalProvider } from "./local.js";
 export { S3Provider } from "./s3.js";
 export { GDriveProvider, linkGoogleDrive } from "./gdrive.js";
 export { OneDriveProvider, linkOneDrive } from "./onedrive.js";
-export type { CloudProvider, PutObjectInput, PutObjectResult } from "./types.js";
+export type {
+  CloudProvider,
+  GetObjectResult,
+  PutObjectInput,
+  PutObjectResult,
+} from "./types.js";

@@ -5,6 +5,7 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { Readable } from "node:stream";
 import type { S3ProviderConfig } from "../config/types.js";
 import type {
@@ -95,7 +96,19 @@ export class S3Provider implements CloudProvider {
     };
   }
 
-  /** Optional helper used in tests / setup docs — create bucket if missing. */
+  /** Presigned GET so OneDrive/relay can pull from the hub without laptop bytes. */
+  async getSignedGetUrl(
+    remotePath: string,
+    expiresInSeconds = 3600,
+  ): Promise<string> {
+    const key = remotePath.replace(/^\/+/, "");
+    return getSignedUrl(
+      this.client,
+      new GetObjectCommand({ Bucket: this.bucket, Key: key }),
+      { expiresIn: expiresInSeconds },
+    );
+  }
+
   async ensureBucket(): Promise<void> {
     try {
       await this.client.send(new HeadBucketCommand({ Bucket: this.bucket }));

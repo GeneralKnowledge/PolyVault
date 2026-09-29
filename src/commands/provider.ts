@@ -1,6 +1,12 @@
 import { mkdir } from "node:fs/promises";
 import open from "open";
-import { addProvider, loadConfig, setPrimaryProvider } from "../config/store.js";
+import {
+  addReplica,
+  clearRelay,
+  loadConfig,
+  setHub,
+  setRelay,
+} from "../config/store.js";
 import type { ProviderKind } from "../config/types.js";
 import { linkGoogleDrive, linkOneDrive } from "../providers/index.js";
 import { resolveLocalPath } from "../util/path.js";
@@ -10,78 +16,22 @@ async function openBrowser(url: string): Promise<void> {
   await open(url);
 }
 
-export async function runProviderList(): Promise<void> {
-  const config = await loadConfig();
-  if (config.providers.length === 0) {
-    console.log("No providers configured. Run `polyvault provider add <kind>`.");
-    return;
-  }
+type AddFlags = {
+  name?: string;
+  path?: string;
+  endpoint?: string;
+  region?: string;
+  bucket?: string;
+  accessKeyId?: string;
+  secretAccessKey?: string;
+  forcePathStyle?: boolean;
+  clientId?: string;
+  clientSecret?: string;
+  tenant?: string;
+};
 
-  console.log(`Providers (${config.providers.length}):`);
-  if (config.primaryProvider) {
-    console.log(
-      `Primary hub (receives original upload): ${config.primaryProvider}\n`,
-    );
-  } else {
-    console.log("");
-  }
-  for (const p of config.providers) {
-    const hub = p.name === config.primaryProvider ? "  ★ primary" : "";
-    switch (p.kind) {
-      case "local":
-        console.log(`  • ${p.name}  [local]  path=${p.path}${hub}`);
-        break;
-      case "s3":
-        console.log(
-          `  • ${p.name}  [s3]  bucket=${p.bucket}  endpoint=${p.endpoint}${hub}`,
-        );
-        break;
-      case "gdrive":
-        console.log(
-          `  • ${p.name}  [gdrive]  clientId=${p.clientId.slice(0, 12)}…${hub}`,
-        );
-        break;
-      case "onedrive":
-        console.log(
-          `  • ${p.name}  [onedrive]  clientId=${p.clientId.slice(0, 12)}…  tenant=${p.tenant ?? "common"}${hub}`,
-        );
-        break;
-    }
-  }
-}
-
-export async function runProviderSetPrimary(name: string): Promise<void> {
-  await setPrimaryProvider(name);
-  console.log(`Primary hub set to "${name}" (original uploads go here first).`);
-}
-
-export async function runProviderAdd(
-  kind: string,
-  flags: {
-    name?: string;
-    path?: string;
-    endpoint?: string;
-    region?: string;
-    bucket?: string;
-    accessKeyId?: string;
-    secretAccessKey?: string;
-    forcePathStyle?: boolean;
-    clientId?: string;
-    clientSecret?: string;
-    tenant?: string;
-    primary?: boolean;
-  },
-): Promise<void> {
-  const valid: ProviderKind[] = ["local", "s3", "gdrive", "onedrive"];
-  if (!valid.includes(kind as ProviderKind)) {
-    throw new Error(
-      `Unknown provider kind "${kind}". Expected one of: ${valid.join(", ")}`,
-    );
-  }
-
-  let addedName = "";
-
-  switch (kind as ProviderKind) {
+async function buildProvider(kind: ProviderKind, flags: AddFlags) {
+  switch (kind) {
     case "local": {
       const name = flags.name ?? (await prompt("Provider name", "local"));
       const pathRaw =
@@ -92,16 +42,13 @@ export async function runProviderAdd(
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.warn(
-          `Warning: could not create directory "${path}" (${message}). Provider will still be saved; uploads may fail.`,
+          `Warning: could not create directory "${path}" (${message}).`,
         );
       }
-      await addProvider({ kind: "local", name, path });
-      addedName = name;
-      console.log(`Added local provider "${name}" → ${path}`);
-      break;
+      return { kind: "local" as const, name, path };
     }
     case "s3": {
-      const name = flags.name ?? (await prompt("Provider name", "s3"));
+      const name = flags.name ?? (await prompt("Provider name", "r2"));
       const endpoint =
         flags.endpoint ??
         (await promptRequired(
@@ -113,20 +60,16 @@ export async function runProviderAdd(
         flags.accessKeyId ?? (await promptRequired("Access key ID"));
       const secretAccessKey =
         flags.secretAccessKey ?? (await promptRequired("Secret access key"));
-      const forcePathStyle = flags.forcePathStyle ?? true;
-      await addProvider({
-        kind: "s3",
+      return {
+        kind: "s3" as const,
         name,
         endpoint,
         region,
         bucket,
         accessKeyId,
         secretAccessKey,
-        forcePathStyle,
-      });
-      addedName = name;
-      console.log(`Added S3 provider "${name}" → s3://${bucket} @ ${endpoint}`);
-      break;
+        forcePathStyle: flags.forcePathStyle ?? true,
+      };
     }
     case "gdrive": {
       const name = flags.name ?? (await prompt("Provider name", "gdrive"));
@@ -135,16 +78,12 @@ export async function runProviderAdd(
       const clientSecret =
         flags.clientSecret ??
         (await promptRequired("Google OAuth client secret"));
-      const linked = await linkGoogleDrive({
+      return linkGoogleDrive({
         name,
         clientId,
         clientSecret,
         openBrowser,
       });
-      await addProvider(linked);
-      addedName = name;
-      console.log(`Added Google Drive provider "${name}"`);
-      break;
     }
     case "onedrive": {
       const name = flags.name ?? (await prompt("Provider name", "onedrive"));
@@ -155,29 +94,144 @@ export async function runProviderAdd(
         flags.clientSecret ??
         (await promptRequired("Microsoft OAuth client secret"));
       const tenant = flags.tenant ?? (await prompt("Tenant", "common"));
-      const linked = await linkOneDrive({
+      return linkOneDrive({
         name,
         clientId,
         clientSecret,
         tenant,
         openBrowser,
       });
-      await addProvider(linked);
-      addedName = name;
-      console.log(`Added OneDrive provider "${name}"`);
-      break;
     }
+  }
+}
+
+export async function runHubSet(kind: string, flags: AddFlags): Promise<void> {
+  const valid: ProviderKind[] = ["local", "s3"];
+  if (!valid.includes(kind as ProviderKind)) {
+    throw new Error(
+      `Hub kind must be local (tests) or s3/R2 (recommended free hub). Got "${kind}".`,
+    );
+  }
+  if (kind === "s3") {
+    console.log(
+      "Recommended free hub: Cloudflare R2 (10GB free, free egress).",
+    );
+  } else {
+    console.log(
+      "Local hub is for tests only. For real multi-cloud use `polyvault hub set s3`.",
+    );
+  }
+  const provider = await buildProvider(kind as ProviderKind, flags);
+  await setHub(provider);
+  console.log(`Hub set to "${provider.name}" [${provider.kind}]`);
+}
+
+export async function runProviderAdd(
+  kind: string,
+  flags: AddFlags,
+): Promise<void> {
+  const valid: ProviderKind[] = ["local", "s3", "gdrive", "onedrive"];
+  if (!valid.includes(kind as ProviderKind)) {
+    throw new Error(
+      `Unknown provider kind "${kind}". Expected one of: ${valid.join(", ")}`,
+    );
+  }
+  const config = await loadConfig();
+  if (!config.hub) {
+    throw new Error(
+      "Set the free hub first: `polyvault hub set s3` (R2) or `hub set local` for tests.",
+    );
+  }
+  const provider = await buildProvider(kind as ProviderKind, flags);
+  await addReplica(provider);
+  console.log(`Added replica "${provider.name}" [${provider.kind}]`);
+  if (provider.kind === "gdrive") {
+    console.log(
+      "Tip: configure a free relay (`polyvault relay set`) so Drive is filled from the hub off-laptop.",
+    );
+  }
+  if (provider.kind === "onedrive") {
+    console.log(
+      "Tip: with an R2/S3 hub, OneDrive Personal can URL-pull from the hub (no laptop bridge).",
+    );
+  }
+}
+
+export async function runProviderList(): Promise<void> {
+  const config = await loadConfig();
+  if (!config.hub && config.replicas.length === 0) {
+    console.log("Nothing configured. Start with `polyvault hub set s3`.");
+    return;
   }
 
-  if (flags.primary && addedName) {
-    await setPrimaryProvider(addedName);
-    console.log(`Marked "${addedName}" as primary hub.`);
+  if (config.hub) {
+    console.log("Hub (receives original once):");
+    printOne(config.hub, " ★ hub");
   } else {
-    const config = await loadConfig();
-    if (config.primaryProvider === addedName) {
-      console.log(
-        `(Primary hub — original file uploads here once, then replicates outward.)`,
-      );
-    }
+    console.log("Hub: (not set)");
   }
+
+  console.log(`\nReplicas (${config.replicas.length}):`);
+  if (config.replicas.length === 0) {
+    console.log("  (none)");
+  } else {
+    for (const p of config.replicas) printOne(p, "");
+  }
+
+  console.log(
+    `\nRelay: ${config.relay?.url ?? "(not set — Oracle Always Free VM recommended)"}`,
+  );
+}
+
+function printOne(
+  p: {
+    kind: string;
+    name: string;
+    path?: string;
+    bucket?: string;
+    endpoint?: string;
+    clientId?: string;
+    tenant?: string;
+  },
+  suffix: string,
+): void {
+  switch (p.kind) {
+    case "local":
+      console.log(`  • ${p.name}  [local]  path=${p.path}${suffix}`);
+      break;
+    case "s3":
+      console.log(
+        `  • ${p.name}  [s3]  bucket=${p.bucket}  endpoint=${p.endpoint}${suffix}`,
+      );
+      break;
+    case "gdrive":
+      console.log(
+        `  • ${p.name}  [gdrive]  clientId=${(p.clientId ?? "").slice(0, 12)}…${suffix}`,
+      );
+      break;
+    case "onedrive":
+      console.log(
+        `  • ${p.name}  [onedrive]  clientId=${(p.clientId ?? "").slice(0, 12)}…  tenant=${p.tenant ?? "common"}${suffix}`,
+      );
+      break;
+  }
+}
+
+export async function runRelaySet(options: {
+  url: string;
+  token?: string;
+}): Promise<void> {
+  const token =
+    options.token ??
+    (await promptRequired("Relay shared token (RELAY_TOKEN on the VM)"));
+  await setRelay({ url: options.url.replace(/\/+$/, ""), token });
+  console.log(`Relay set to ${options.url}`);
+  console.log(
+    "Puts will ask this relay to stream hub → Drive/OneDrive off your laptop.",
+  );
+}
+
+export async function runRelayClear(): Promise<void> {
+  await clearRelay();
+  console.log("Relay cleared.");
 }

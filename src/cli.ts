@@ -2,9 +2,11 @@
 import { Command } from "commander";
 import { runInit } from "./commands/init.js";
 import {
+  runHubSet,
   runProviderAdd,
   runProviderList,
-  runProviderSetPrimary,
+  runRelayClear,
+  runRelaySet,
 } from "./commands/provider.js";
 import { runPut } from "./commands/put.js";
 import { runStatus } from "./commands/status.js";
@@ -14,9 +16,9 @@ const program = new Command();
 program
   .name("polyvault")
   .description(
-    "Upload a file once to a primary hub; replicate to other linked clouds.",
+    "Upload once to a free R2/S3 hub; replicate to Drive/OneDrive/etc. via URL-pull or relay.",
   )
-  .version("0.1.0");
+  .version("0.2.0");
 
 program
   .command("init")
@@ -26,20 +28,40 @@ program
     await runInit({ force: opts.force });
   });
 
+const hub = program
+  .command("hub")
+  .description("Configure the free hub that receives the original upload");
+
+hub
+  .command("set")
+  .description("Set hub to s3/R2 (recommended) or local (tests)")
+  .argument("<kind>", "local | s3")
+  .option("--name <name>", "Hub name")
+  .option("--path <path>", "Local path (local hub)")
+  .option("--endpoint <url>", "S3/R2 endpoint")
+  .option("--region <region>", "S3 region", "auto")
+  .option("--bucket <bucket>", "S3/R2 bucket")
+  .option("--access-key-id <key>", "Access key ID")
+  .option("--secret-access-key <secret>", "Secret access key")
+  .option("--force-path-style", "Path-style S3 URLs", true)
+  .action(async (kind: string, opts: Record<string, unknown>) => {
+    await runHubSet(kind, opts as never);
+  });
+
 const provider = program
   .command("provider")
-  .description("Manage cloud providers");
+  .description("Manage replica destinations (filled from the hub)");
 
 provider
   .command("list")
-  .description("List configured providers")
+  .description("List hub, replicas, and relay")
   .action(async () => {
     await runProviderList();
   });
 
 provider
   .command("add")
-  .description("Add a provider (local | s3 | gdrive | onedrive)")
+  .description("Add a replica (local | s3 | gdrive | onedrive)")
   .argument("<kind>", "Provider kind")
   .option("--name <name>", "Provider display name")
   .option("--path <path>", "Local filesystem path (local)")
@@ -52,53 +74,43 @@ provider
   .option("--client-id <id>", "OAuth client ID (gdrive/onedrive)")
   .option("--client-secret <secret>", "OAuth client secret")
   .option("--tenant <tenant>", "Microsoft tenant (onedrive)", "common")
-  .option("--primary", "Make this provider the upload hub")
-  .action(
-    async (
-      kind: string,
-      opts: {
-        name?: string;
-        path?: string;
-        endpoint?: string;
-        region?: string;
-        bucket?: string;
-        accessKeyId?: string;
-        secretAccessKey?: string;
-        forcePathStyle?: boolean;
-        clientId?: string;
-        clientSecret?: string;
-        tenant?: string;
-        primary?: boolean;
-      },
-    ) => {
-      await runProviderAdd(kind, opts);
-    },
-  );
+  .action(async (kind: string, opts: Record<string, unknown>) => {
+    await runProviderAdd(kind, opts as never);
+  });
 
-provider
-  .command("set-primary")
-  .description("Choose which provider receives the original upload")
-  .argument("<name>", "Provider name")
-  .action(async (name: string) => {
-    await runProviderSetPrimary(name);
+const relay = program
+  .command("relay")
+  .description("Optional free-tier relay VM (hub → clouds off-laptop)");
+
+relay
+  .command("set")
+  .description("Point CLI at your relay (Oracle Always Free recommended)")
+  .requiredOption("--url <url>", "Relay base URL, e.g. http://1.2.3.4:8787")
+  .option("--token <token>", "Shared bearer token (or prompt)")
+  .action(async (opts: { url: string; token?: string }) => {
+    await runRelaySet(opts);
+  });
+
+relay
+  .command("clear")
+  .description("Remove relay configuration")
+  .action(async () => {
+    await runRelayClear();
   });
 
 program
   .command("put")
   .description(
-    "Upload the original once to the primary hub, then replicate to other providers",
+    "Upload original once to hub; replicate to replicas (relay / URL-pull / hub-copy)",
   )
   .argument("<file>", "Local file to upload")
-  .option("--to <names>", "Comma-separated provider names")
-  .option(
-    "--remote-dir <dir>",
-    "Remote folder (default: PolyVault from config)",
-  )
-  .option("--primary <name>", "Override primary hub for this put")
+  .option("--to <names>", "Comma-separated replica names")
+  .option("--remote-dir <dir>", "Remote folder (default: PolyVault)")
+  .option("--bridge", "Force laptop-bridge replication (debug)")
   .action(
     async (
       file: string,
-      opts: { to?: string; remoteDir?: string; primary?: string },
+      opts: { to?: string; remoteDir?: string; bridge?: boolean },
     ) => {
       const outcomes = await runPut(file, opts);
       if (outcomes.some((o) => !o.ok)) {
@@ -109,7 +121,7 @@ program
 
 program
   .command("status")
-  .description("Show configured providers and last put result")
+  .description("Show hub, replicas, relay, and last put")
   .action(async () => {
     await runStatus();
   });

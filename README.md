@@ -1,202 +1,160 @@
 # PolyVault
 
-Upload a file **once** to a primary hub; it then **replicates** to your other linked clouds.
+Upload a file **once** to a **free hub** (Cloudflare R2). Replicas are filled **from the hub**, not by uploading the original again.
+
+```text
+laptop ──(once)──► R2 hub (free)
+                      │
+                      ├── URL-pull ──► OneDrive Personal
+                      └── free relay ─► Google Drive / OneDrive / …
+```
 
 ```bash
 polyvault put ./hello.txt
 ```
 
-`hello.txt` ends up in every linked destination (local folders, S3-compatible, Google Drive, OneDrive) under a shared remote folder (default `PolyVault/`).
+## Architecture
 
-## How put works (important)
+| Piece | Recommendation | Role |
+|--------|----------------|------|
+| **Hub** | Cloudflare R2 (S3 API) | Receives the original once. Free tier: 10 GB, free egress. |
+| **OneDrive replica** | Graph upload-from-URL | Microsoft pulls from an R2 signed URL (no laptop bridge). |
+| **Google Drive replica** | Free relay VM | Oracle Always Free streams `R2 → Drive` off your laptop. |
+| **Fallback** | Laptop bridge | Only if relay/URL-pull unavailable: `hub → laptop → cloud`. |
 
-PolyVault does **not** upload your original file separately to each cloud.
+Local hub + local replicas are supported for tests (`hub-copy`), but real multi-cloud should use R2 as hub.
 
-1. **Upload once** — the original is sent only to the **primary hub** provider.
-2. **Replicate** — every other provider receives a copy **from the hub**, not another upload of the original source file.
-
-The first provider you link becomes the primary hub (override with `provider add --primary`, `provider set-primary`, or `put --primary`).
-
-Until a cloud-to-cloud relay VM exists, replica hops may still transit this machine (download from hub → upload to replica). The original source file is still only uploaded once.
-
-## Requirements
-
-- Node.js 20+
-- npm
-
-## Install / build
+## Install
 
 ```bash
 npm install
 npm run build
-npm link          # optional: put `polyvault` on your PATH
+npm link   # optional
 ```
 
-Development without building:
+Config: `~/.polyvault/` (override with `POLYVAULT_HOME`). Secrets mode `0600`.
 
-```bash
-npm run dev -- init
-npm run dev -- put ./hello.txt
-```
+## Quickstart
 
-Config lives in `~/.polyvault/` (override with `POLYVAULT_HOME`). Secrets are stored in `secrets.json` with mode `0600`.
-
-## Quickstart (local providers)
+### 1. Init + free R2 hub
 
 ```bash
 polyvault init
 
-mkdir -p /tmp/pv-a /tmp/pv-b
-polyvault provider add local --name a --path /tmp/pv-a   # becomes primary hub
-polyvault provider add local --name b --path /tmp/pv-b   # replica
-
-echo 'hi' > hello.txt
-polyvault put hello.txt
-
-# original → /tmp/pv-a/PolyVault/hello.txt  (primary)
-# hub copy → /tmp/pv-b/PolyVault/hello.txt  (replica)
-
-polyvault status
-polyvault provider list
+polyvault hub set s3 \
+  --name r2 \
+  --endpoint https://<ACCOUNT_ID>.r2.cloudflarestorage.com \
+  --region auto \
+  --bucket polyvault \
+  --access-key-id <KEY> \
+  --secret-access-key <SECRET>
 ```
 
-Partial failure: if the primary succeeds but a replica fails, other replicas can still succeed; exit code is non-zero.
+### 2. Add replicas
 
 ```bash
-polyvault provider add local --name bad --path /tmp/this-is-a-file/nested
-# (create a file at /tmp/this-is-a-file first)
+polyvault provider add onedrive --name onedrive \
+  --client-id <APP_ID> --client-secret <SECRET>
+
+polyvault provider add gdrive --name gdrive \
+  --client-id <CLIENT_ID> --client-secret <CLIENT_SECRET>
+```
+
+### 3. Optional: free relay (recommended for Drive)
+
+On an **Oracle Always Free** VM (or any small always-on host):
+
+```bash
+git clone <this-repo> && cd PolyVault && npm install && npm run build
+export RELAY_TOKEN="$(openssl rand -hex 24)"
+export PORT=8787
+npm run relay:prod
+# open firewall for TCP 8787
+```
+
+On your laptop:
+
+```bash
+polyvault relay set --url http://YOUR_VM_IP:8787 --token "$RELAY_TOKEN"
+```
+
+### 4. Put once
+
+```bash
+echo 'hi' > hello.txt
 polyvault put hello.txt
-# ✓ primary a  ✓ replica b  ✗ replica bad   exit code 1
+```
+
+Expected modes:
+
+- `hub-upload` — original → R2 only
+- `onedrive-url-pull` — OneDrive pulls from R2 signed URL
+- `relay` — VM streams R2 → Drive
+- `hub-copy` — local tests
+- `laptop-bridge` — last-resort fallback (prints a warning)
+
+## Local test (no cloud)
+
+```bash
+polyvault init
+polyvault hub set local --name hub --path /tmp/pv-hub
+polyvault provider add local --name replica --path /tmp/pv-replica
+echo hi > hello.txt
+polyvault put hello.txt
+# /tmp/pv-hub/PolyVault/hello.txt
+# /tmp/pv-replica/PolyVault/hello.txt   (copied from hub)
 ```
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `polyvault init` | Create config under `~/.polyvault/` |
-| `polyvault provider add <kind>` | Link a provider (`local`, `s3`, `gdrive`, `onedrive`) |
-| `polyvault provider set-primary <name>` | Choose which provider receives the original upload |
-| `polyvault provider list` | List linked providers |
-| `polyvault put <file>` | Upload once to primary, replicate to others |
-| `polyvault status` | Show providers + last put result |
+| `polyvault init` | Create config |
+| `polyvault hub set s3\|local` | Set free hub (R2 recommended) |
+| `polyvault provider add <kind>` | Add replica |
+| `polyvault provider list` | Show hub + replicas + relay |
+| `polyvault relay set --url …` | Point at free relay VM |
+| `polyvault relay clear` | Remove relay |
+| `polyvault put <file>` | Upload once to hub; replicate |
+| `polyvault status` | Hub/replicas/last put |
 
-`put` options:
+`put` options: `--to`, `--remote-dir`, `--bridge` (force laptop bridge).
 
-- `--remote-dir <dir>` — remote folder (default `PolyVault`)
-- `--to <names>` — comma-separated provider names
-- `--primary <name>` — override hub for this put
+## OAuth redirect URI
 
-## S3-compatible (Cloudflare R2 / Backblaze B2 / MinIO)
-
-```bash
-polyvault provider add s3 \
-  --name r2 \
-  --endpoint https://<ACCOUNT_ID>.r2.cloudflarestorage.com \
-  --region auto \
-  --bucket my-polyvault \
-  --access-key-id <KEY> \
-  --secret-access-key <SECRET> \
-  --primary
-```
-
-**Backblaze B2** (S3-compatible API):
-
-```bash
-polyvault provider add s3 \
-  --name b2 \
-  --endpoint https://s3.us-west-004.backblazeb2.com \
-  --region us-west-004 \
-  --bucket my-polyvault \
-  --access-key-id <keyID> \
-  --secret-access-key <applicationKey>
-```
-
-**MinIO** (local):
-
-```bash
-polyvault provider add s3 \
-  --name minio \
-  --endpoint http://127.0.0.1:9000 \
-  --region us-east-1 \
-  --bucket polyvault \
-  --access-key-id minioadmin \
-  --secret-access-key minioadmin
-```
-
-## Google Drive OAuth
-
-1. Open [Google Cloud Console](https://console.cloud.google.com/) → APIs & Services → enable **Google Drive API**.
-2. Create OAuth client ID → application type **Desktop app** (or Web with loopback).
-3. Add authorized redirect URI:
-
-   ```
-   http://127.0.0.1:8765/callback
-   ```
-
-4. Copy client ID and secret, then:
-
-```bash
-polyvault provider add gdrive --name gdrive \
-  --client-id <CLIENT_ID> \
-  --client-secret <CLIENT_SECRET>
-```
-
-A browser window opens; after consent, PolyVault stores the refresh token under `~/.polyvault/secrets.json`.
-
-## Microsoft OneDrive OAuth
-
-1. Open [Azure Portal](https://portal.azure.com/) → App registrations → **New registration**.
-2. Supported account types: personal Microsoft accounts and/or work/school (use tenant `common` for both).
-3. Under **Authentication**, add a platform → **Mobile and desktop** (or Web) with redirect URI:
-
-   ```
-   http://127.0.0.1:8765/callback
-   ```
-
-4. Create a client secret under **Certificates & secrets**.
-5. API permissions: Microsoft Graph delegated `Files.ReadWrite`, `offline_access`.
-
-```bash
-polyvault provider add onedrive --name onedrive \
-  --client-id <APP_ID> \
-  --client-secret <SECRET> \
-  --tenant common
-```
-
-## Example: put a `.txt`
-
-```bash
-echo 'hello from polyvault' > hello.txt
-polyvault put hello.txt --remote-dir PolyVault
-```
-
-Original uploads once to the primary hub; replicas are filled from that hub copy.
-
-## Environment
-
-| Variable | Meaning |
-|----------|---------|
-| `POLYVAULT_HOME` | Config directory (default `~/.polyvault`) |
-
-## Project layout
+Google + Microsoft apps must allow:
 
 ```
-src/
-  cli.ts
-  commands/     # init, provider, put, status
-  config/       # ~/.polyvault load/save (0600 secrets)
-  oauth/        # localhost redirect callback
-  providers/    # local, s3, gdrive, onedrive
-  util/
-test/
+http://127.0.0.1:8765/callback
 ```
+
+See earlier setup notes for Drive API / Graph `Files.ReadWrite` + `offline_access`.
+
+## Relay API
+
+`POST /v1/replicate` with `Authorization: Bearer <token>`:
+
+```json
+{
+  "sourceUrl": "https://…r2…/presigned-get",
+  "remotePath": "PolyVault/hello.txt",
+  "size": 123,
+  "destination": { "kind": "gdrive", "name": "gdrive", "...": "…" }
+}
+```
+
+`GET /health` → `{ "ok": true }`.
+
+## Why not free Cloudflare Workers as the relay?
+
+Workers Free allows only ~**10 ms CPU** per invocation — too little to stream files to Drive. Workers Paid (~$5/mo) can work, but Oracle Always Free is the $0 path.
 
 ## Roadmap
 
-- **Cloud-to-cloud relay VM** — push replicas from the hub without pulling bytes back through your laptop.
-- **Encryption** — client-side encrypt before upload; decrypt on download (not in v1).
-- **More providers** — Dropbox, Mega, WebDAV.
-- Folder backup / incremental sync / manifests.
+- Encryption at rest / before upload
+- Dropbox, Mega, WebDAV replicas
+- Hardened relay (mTLS, per-user tokens, multipart streaming without buffering)
+- Auto-provision R2 + relay docs/scripts
 
 ## License
 
