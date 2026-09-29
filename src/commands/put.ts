@@ -225,16 +225,28 @@ export async function runPut(
       let destination: string;
       let remote = remotePath;
 
+      // Preferred hybrid:
+      // 1) OneDrive Personal URL-pull (cloud fetches R2) when hub can sign URLs
+      // 2) Free relay for Drive / other clouds (and OneDrive if URL-pull unavailable)
+      // 3) Local hub-copy / laptop-bridge fallbacks
+      const canUrlPull =
+        !options.bridge &&
+        replica instanceof OneDriveProvider &&
+        Boolean(signedGetUrl);
+
       const canRelay =
         !options.bridge &&
-        config.relay?.url &&
-        config.relay.token &&
-        signedGetUrl &&
+        Boolean(config.relay?.url && config.relay.token && signedGetUrl) &&
         (replicaConfig.kind === "gdrive" ||
           replicaConfig.kind === "onedrive" ||
           replicaConfig.kind === "s3");
 
-      if (canRelay) {
+      if (canUrlPull) {
+        mode = "onedrive-url-pull";
+        const result = await replica.putFromUrl(remotePath, signedGetUrl!);
+        destination = result.destination;
+        remote = result.remotePath;
+      } else if (canRelay) {
         mode = "relay";
         const relayResult = await replicateViaRelay(config.relay!, {
           sourceUrl: signedGetUrl!,
@@ -243,15 +255,6 @@ export async function runPut(
           destination: replicaConfig,
         });
         destination = relayResult.destination ?? `relay://${replicaConfig.name}`;
-      } else if (
-        !options.bridge &&
-        replica instanceof OneDriveProvider &&
-        signedGetUrl
-      ) {
-        mode = "onedrive-url-pull";
-        const result = await replica.putFromUrl(remotePath, signedGetUrl);
-        destination = result.destination;
-        remote = result.remotePath;
       } else if (
         hubProvider instanceof LocalProvider &&
         replica instanceof LocalProvider
@@ -265,12 +268,16 @@ export async function runPut(
         destination = result.destination;
       } else {
         mode = "laptop-bridge";
-        if (
-          replicaConfig.kind === "gdrive" ||
-          replicaConfig.kind === "onedrive"
-        ) {
+        if (replicaConfig.kind === "gdrive") {
           console.log(
-            `  … ${replicaConfig.name}: no relay/URL-pull — bridging via this machine (hub→laptop→cloud)`,
+            `  … ${replicaConfig.name}: no relay configured — bridging via this machine.`,
+          );
+          console.log(
+            `      Set up Oracle Always Free relay (see docs/SETUP.md) to avoid this.`,
+          );
+        } else if (replicaConfig.kind === "onedrive") {
+          console.log(
+            `  … ${replicaConfig.name}: URL-pull unavailable (need R2/S3 hub) and no relay — laptop bridge.`,
           );
         }
         const result = await laptopBridge(hubProvider, replica, remotePath);

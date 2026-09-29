@@ -7,14 +7,12 @@ export async function runInit(options: { force?: boolean }): Promise<void> {
   console.log(`Config: ${getConfigPath()}`);
   console.log(`Default remote directory: ${config.defaultRemoteDir}`);
   console.log(`
-Architecture:
-  1. Set a free hub (Cloudflare R2 recommended):
-       polyvault hub set s3 --name r2 --endpoint https://<id>.r2.cloudflarestorage.com ...
-  2. Add replicas (Drive, OneDrive, local, …):
-       polyvault provider add onedrive|gdrive|local|s3
-  3. Optional free relay VM (Oracle Always Free) for off-laptop Drive pushes:
-       polyvault relay set --url http://YOUR_VM:8787
-  4. Upload once:
-       polyvault put ./hello.txt
+Preferred architecture (see docs/SETUP.md for sign-up steps):
+  1. Cloudflare R2 hub     →  polyvault hub set s3 …
+  2. Oracle Always Free    →  run relay on the VM, then:
+                              polyvault relay set --url http://IP:8787
+  3. OneDrive (URL-pull)   →  polyvault provider add onedrive …
+  4. Google Drive (relay)  →  polyvault provider add gdrive …
+  5. polyvault put ./hello.txt
 `);
 }

@@ -147,12 +147,12 @@ export async function runProviderAdd(
   console.log(`Added replica "${provider.name}" [${provider.kind}]`);
   if (provider.kind === "gdrive") {
     console.log(
-      "Tip: configure a free relay (`polyvault relay set`) so Drive is filled from the hub off-laptop.",
+      "Tip: configure Oracle Always Free relay (`polyvault relay set`) so Drive uses mode=relay (see docs/SETUP.md).",
     );
   }
   if (provider.kind === "onedrive") {
     console.log(
-      "Tip: with an R2/S3 hub, OneDrive Personal can URL-pull from the hub (no laptop bridge).",
+      "Tip: with an R2 hub, OneDrive Personal uses URL-pull (Microsoft fetches from R2). See docs/SETUP.md.",
     );
   }
 }
