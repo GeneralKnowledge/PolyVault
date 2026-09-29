@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+coverage/
+tmp/
+test-fixtures/
+.polyvault-test/
+hello.txt
+local-a/
+local-b/
