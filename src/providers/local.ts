@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
@@ -7,6 +7,7 @@ import type { LocalProviderConfig } from "../config/types.js";
 import type {
   CloudProvider,
   GetObjectResult,
+  HeadObjectResult,
   PutObjectInput,
   PutObjectResult,
 } from "./types.js";
@@ -46,7 +47,16 @@ export class LocalProvider implements CloudProvider {
     return { body, size: body.length };
   }
 
-  /** Direct filesystem path for efficient local→local replication. */
+  async headObject(remotePath: string): Promise<HeadObjectResult | null> {
+    try {
+      const st = await stat(this.absolutePath(remotePath));
+      if (!st.isFile()) return null;
+      return { size: st.size };
+    } catch {
+      return null;
+    }
+  }
+
   resolveAbsolute(remotePath: string): string {
     return this.absolutePath(remotePath);
   }

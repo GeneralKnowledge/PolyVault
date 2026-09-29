@@ -7,6 +7,7 @@ import type {
   ProviderKind,
   ReplicateMode,
 } from "../config/types.js";
+import { isCloudReplica } from "../config/types.js";
 import { createProvider, LocalProvider, S3Provider } from "../providers/index.js";
 import type { CloudProvider } from "../providers/types.js";
 import { OneDriveProvider } from "../providers/onedrive.js";
@@ -16,7 +17,7 @@ import { buildRemotePath } from "../util/path.js";
 export interface PutOptions {
   to?: string;
   remoteDir?: string;
-  /** Force laptop-bridge even when relay/URL-pull is available (debug). */
+  /** Allow laptop-bridge for cloud replicas (debug / no relay). */
   bridge?: boolean;
 }
 
@@ -127,26 +128,13 @@ export async function runPut(
   const remotePath = buildRemotePath(remoteDir, filePath);
   const size = fileStat.size;
 
-  const hubRecommended =
-    hubConfig.kind === "s3"
-      ? "R2/S3 hub"
-      : "local hub (tests only — use R2 for free cloud hub)";
-
   console.log(`Source:     ${filePath}`);
   console.log(`Remote:     ${remotePath}`);
-  console.log(
-    `Hub:        ${hubConfig.name} [${hubConfig.kind}] — ${hubRecommended}`,
-  );
+  console.log(`Hub:        ${hubConfig.name} [${hubConfig.kind}]`);
   console.log(
     `Replicas:   ${replicas.length ? replicas.map((r) => r.name).join(", ") : "(none)"}`,
   );
-  if (config.relay?.url) {
-    console.log(`Relay:      ${config.relay.url}`);
-  } else {
-    console.log(
-      `Relay:      (not set — cloud replicas may use URL-pull or laptop-bridge)`,
-    );
-  }
+  console.log(`Relay:      ${config.relay?.url ?? "(not set)"}`);
   console.log("");
 
   const outcomes: ProviderPutOutcome[] = [];
@@ -190,21 +178,11 @@ export async function runPut(
       file: filePath,
       remoteDir,
       hub: hubConfig.name,
-      results: outcomes.map((o) => ({
-        name: o.name,
-        kind: o.kind,
-        ok: o.ok,
-        role: o.role,
-        mode: o.mode,
-        remotePath: o.remotePath,
-        destination: o.destination,
-        error: o.error,
-      })),
+      results: outcomes,
     });
     return outcomes;
   }
 
-  // Presigned GET from R2/S3 hub for URL-pull / relay.
   let signedGetUrl: string | undefined;
   if (hubProvider instanceof S3Provider) {
     try {
@@ -216,101 +194,271 @@ export async function runPut(
     }
   }
 
-  // 2) Fill replicas from the hub — never re-upload the original source.
-  for (const replicaConfig of replicas) {
+  // Partition replicas
+  const urlPull: ProviderConfig[] = [];
+  const relayBatch: ProviderConfig[] = [];
+  const localCopies: ProviderConfig[] = [];
+  const bridgeNeeded: ProviderConfig[] = [];
+
+  for (const r of replicas) {
+    if (r.kind === "local") {
+      localCopies.push(r);
+      continue;
+    }
+    if (
+      !options.bridge &&
+      r.kind === "onedrive" &&
+      signedGetUrl
+    ) {
+      urlPull.push(r);
+      continue;
+    }
+    if (
+      !options.bridge &&
+      config.relay?.url &&
+      config.relay.token &&
+      signedGetUrl &&
+      isCloudReplica(r.kind)
+    ) {
+      relayBatch.push(r);
+      continue;
+    }
+    bridgeNeeded.push(r);
+  }
+
+  // 2a) OneDrive URL-pull (Microsoft fetches R2)
+  for (const replicaConfig of urlPull) {
     const started = Date.now();
-    let mode: ReplicateMode = "laptop-bridge";
+    try {
+      const replica = createProvider(replicaConfig) as OneDriveProvider;
+      const result = await replica.putFromUrl(remotePath, signedGetUrl!);
+      outcomes.push({
+        name: replicaConfig.name,
+        kind: replicaConfig.kind,
+        role: "replica",
+        mode: "onedrive-url-pull",
+        ok: true,
+        remotePath: result.remotePath,
+        destination: result.destination,
+        ms: Date.now() - started,
+      });
+      console.log(
+        `  ✓ replica ${replicaConfig.name} ← onedrive-url-pull (${Date.now() - started}ms)`,
+      );
+      console.log(`      ${result.destination}`);
+    } catch (err) {
+      // Fall through to relay batch if available
+      if (config.relay?.url && config.relay.token && signedGetUrl) {
+        console.log(
+          `  … ${replicaConfig.name}: URL-pull failed, queueing to relay`,
+        );
+        relayBatch.push(replicaConfig);
+      } else {
+        const error = err instanceof Error ? err.message : String(err);
+        outcomes.push({
+          name: replicaConfig.name,
+          kind: replicaConfig.kind,
+          role: "replica",
+          mode: "onedrive-url-pull",
+          ok: false,
+          error,
+          ms: Date.now() - started,
+        });
+        console.log(`  ✗ replica ${replicaConfig.name} FAILED (onedrive-url-pull)`);
+        console.log(`      ${error}`);
+      }
+    }
+  }
+
+  // 2b) One relay job: hub pull once → many destinations in parallel
+  if (relayBatch.length > 0) {
+    const started = Date.now();
+    console.log(
+      `  … relay fan-out → ${relayBatch.map((r) => r.name).join(", ")}`,
+    );
+    try {
+      const relayResult = await replicateViaRelay(config.relay!, {
+        sourceUrl: signedGetUrl!,
+        remotePath,
+        size,
+        destinations: relayBatch,
+        options: { retries: 3, skipIfSameSize: true },
+      });
+      const byName = new Map(
+        relayResult.results.map((r) => [r.name, r] as const),
+      );
+      for (const dest of relayBatch) {
+        const r = byName.get(dest.name);
+        if (!r) {
+          outcomes.push({
+            name: dest.name,
+            kind: dest.kind,
+            role: "replica",
+            mode: "relay",
+            ok: false,
+            error: "Missing result from relay",
+            ms: Date.now() - started,
+          });
+          continue;
+        }
+        const mode: ReplicateMode = r.skipped ? "skipped" : "relay";
+        outcomes.push({
+          name: dest.name,
+          kind: dest.kind,
+          role: "replica",
+          mode,
+          ok: r.ok,
+          remotePath,
+          destination: r.destination,
+          error: r.error,
+          ms: Date.now() - started,
+        });
+        if (r.ok) {
+          console.log(
+            `  ✓ replica ${dest.name} ← ${mode}`,
+          );
+          console.log(`      ${r.destination}`);
+        } else {
+          console.log(`  ✗ replica ${dest.name} FAILED (relay)`);
+          console.log(`      ${r.error}`);
+        }
+      }
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      for (const dest of relayBatch) {
+        outcomes.push({
+          name: dest.name,
+          kind: dest.kind,
+          role: "replica",
+          mode: "relay",
+          ok: false,
+          error,
+          ms: Date.now() - started,
+        });
+        console.log(`  ✗ replica ${dest.name} FAILED (relay)`);
+        console.log(`      ${error}`);
+      }
+    }
+  }
+
+  // 2c) Local replicas — copy from local hub, or pull from cloud hub onto disk
+  for (const replicaConfig of localCopies) {
+    const started = Date.now();
     try {
       const replica = createProvider(replicaConfig);
-      let destination: string;
-      let remote = remotePath;
-
-      // Preferred hybrid:
-      // 1) OneDrive Personal URL-pull (cloud fetches R2) when hub can sign URLs
-      // 2) Free relay for Drive / other clouds (and OneDrive if URL-pull unavailable)
-      // 3) Local hub-copy / laptop-bridge fallbacks
-      const canUrlPull =
-        !options.bridge &&
-        replica instanceof OneDriveProvider &&
-        Boolean(signedGetUrl);
-
-      const canRelay =
-        !options.bridge &&
-        Boolean(config.relay?.url && config.relay.token && signedGetUrl) &&
-        (replicaConfig.kind === "gdrive" ||
-          replicaConfig.kind === "onedrive" ||
-          replicaConfig.kind === "s3");
-
-      if (canUrlPull) {
-        mode = "onedrive-url-pull";
-        const result = await replica.putFromUrl(remotePath, signedGetUrl!);
-        destination = result.destination;
-        remote = result.remotePath;
-      } else if (canRelay) {
-        mode = "relay";
-        const relayResult = await replicateViaRelay(config.relay!, {
-          sourceUrl: signedGetUrl!,
+      if (!(replica instanceof LocalProvider)) {
+        throw new Error("Expected local provider");
+      }
+      const head = await replica.headObject(remotePath);
+      if (head && head.size === size) {
+        outcomes.push({
+          name: replicaConfig.name,
+          kind: replicaConfig.kind,
+          role: "replica",
+          mode: "skipped",
+          ok: true,
           remotePath,
-          size,
-          destination: replicaConfig,
+          destination: replica.resolveAbsolute(remotePath),
+          ms: Date.now() - started,
         });
-        destination = relayResult.destination ?? `relay://${replicaConfig.name}`;
-      } else if (
-        hubProvider instanceof LocalProvider &&
-        replica instanceof LocalProvider
-      ) {
+        console.log(`  ✓ replica ${replicaConfig.name} ← skipped (same size)`);
+        continue;
+      }
+
+      let result: { remotePath: string; destination: string };
+      let mode: ReplicateMode;
+      if (hubProvider instanceof LocalProvider) {
         mode = "hub-copy";
-        const result = await copyLocalHubToLocalReplica(
+        result = await copyLocalHubToLocalReplica(
           hubProvider,
           replica,
           remotePath,
         );
-        destination = result.destination;
       } else {
-        mode = "laptop-bridge";
-        if (replicaConfig.kind === "gdrive") {
-          console.log(
-            `  … ${replicaConfig.name}: no relay configured — bridging via this machine.`,
-          );
-          console.log(
-            `      Set up Oracle Always Free relay (see docs/SETUP.md) to avoid this.`,
-          );
-        } else if (replicaConfig.kind === "onedrive") {
-          console.log(
-            `  … ${replicaConfig.name}: URL-pull unavailable (need R2/S3 hub) and no relay — laptop bridge.`,
-          );
-        }
-        const result = await laptopBridge(hubProvider, replica, remotePath);
-        destination = result.destination;
-        remote = result.remotePath;
+        // Pull hub object down to a local folder (not a re-upload of the original).
+        mode = "hub-copy";
+        result = await laptopBridge(hubProvider, replica, remotePath);
       }
-
       outcomes.push({
         name: replicaConfig.name,
         kind: replicaConfig.kind,
         role: "replica",
         mode,
         ok: true,
-        remotePath: remote,
-        destination,
+        remotePath: result.remotePath,
+        destination: result.destination,
         ms: Date.now() - started,
       });
       console.log(
         `  ✓ replica ${replicaConfig.name} ← ${mode} (${Date.now() - started}ms)`,
       );
-      console.log(`      ${destination}`);
+      console.log(`      ${result.destination}`);
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
       outcomes.push({
         name: replicaConfig.name,
         kind: replicaConfig.kind,
         role: "replica",
-        mode,
+        mode: "hub-copy",
         ok: false,
         error,
         ms: Date.now() - started,
       });
-      console.log(`  ✗ replica ${replicaConfig.name} FAILED (${mode})`);
+      console.log(`  ✗ replica ${replicaConfig.name} FAILED (hub-copy)`);
+      console.log(`      ${error}`);
+    }
+  }
+
+  // 2d) Cloud without relay/URL-pull
+  for (const replicaConfig of bridgeNeeded) {
+    if (!options.bridge && isCloudReplica(replicaConfig.kind)) {
+      const msg =
+        `No off-laptop path for "${replicaConfig.name}". ` +
+        `Configure R2 hub + Oracle relay (docs/SETUP.md), or pass --bridge to force laptop transit.`;
+      outcomes.push({
+        name: replicaConfig.name,
+        kind: replicaConfig.kind,
+        role: "replica",
+        mode: "laptop-bridge",
+        ok: false,
+        error: msg,
+        ms: 0,
+      });
+      console.log(`  ✗ replica ${replicaConfig.name} FAILED`);
+      console.log(`      ${msg}`);
+      continue;
+    }
+
+    const started = Date.now();
+    try {
+      const replica = createProvider(replicaConfig);
+      const result = await laptopBridge(hubProvider, replica, remotePath);
+      outcomes.push({
+        name: replicaConfig.name,
+        kind: replicaConfig.kind,
+        role: "replica",
+        mode: "laptop-bridge",
+        ok: true,
+        remotePath: result.remotePath,
+        destination: result.destination,
+        ms: Date.now() - started,
+      });
+      console.log(
+        `  ✓ replica ${replicaConfig.name} ← laptop-bridge (${Date.now() - started}ms)`,
+      );
+      console.log(`      ${result.destination}`);
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      outcomes.push({
+        name: replicaConfig.name,
+        kind: replicaConfig.kind,
+        role: "replica",
+        mode: "laptop-bridge",
+        ok: false,
+        error,
+        ms: Date.now() - started,
+      });
+      console.log(`  ✗ replica ${replicaConfig.name} FAILED (laptop-bridge)`);
       console.log(`      ${error}`);
     }
   }

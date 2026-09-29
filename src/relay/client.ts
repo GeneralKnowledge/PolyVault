@@ -1,27 +1,35 @@
-import type {
-  GDriveProviderConfig,
-  OneDriveProviderConfig,
-  ProviderConfig,
-  RelayConfig,
-} from "../config/types.js";
+import type { ProviderConfig, RelayConfig } from "../config/types.js";
 
 export interface RelayReplicateRequest {
   sourceUrl: string;
   remotePath: string;
   size?: number;
   contentType?: string;
-  destination: ProviderConfig;
+  destinations: ProviderConfig[];
+  options?: {
+    retries?: number;
+    skipIfSameSize?: boolean;
+  };
 }
 
-export interface RelayReplicateResponse {
+export interface RelayDestResult {
+  name: string;
+  kind: string;
   ok: boolean;
+  skipped?: boolean;
   destination?: string;
   error?: string;
 }
 
+export interface RelayReplicateResponse {
+  ok: boolean;
+  results: RelayDestResult[];
+  error?: string;
+}
+
 /**
- * Ask a free-tier relay VM to pull from the hub URL and push to a cloud replica.
- * Tokens travel only to your own relay (Oracle Always Free, etc.).
+ * Ask the free-tier relay to pull the hub object once and push to many
+ * destinations in parallel.
  */
 export async function replicateViaRelay(
   relay: RelayConfig,
@@ -29,6 +37,9 @@ export async function replicateViaRelay(
 ): Promise<RelayReplicateResponse> {
   if (!relay.url) throw new Error("Relay URL not configured");
   if (!relay.token) throw new Error("Relay token not configured");
+  if (!request.destinations.length) {
+    throw new Error("No destinations for relay");
+  }
 
   const base = relay.url.replace(/\/+$/, "");
   const res = await fetch(`${base}/v1/replicate`, {
@@ -48,10 +59,13 @@ export async function replicateViaRelay(
     throw new Error(`Relay returned non-JSON (${res.status}): ${text}`);
   }
 
-  if (!res.ok || !parsed.ok) {
+  if (!parsed.results) {
+    parsed.results = [];
+  }
+
+  // Don't throw on partial failure — caller maps per-destination results.
+  if (!res.ok && parsed.results.length === 0) {
     throw new Error(parsed.error ?? `Relay failed with HTTP ${res.status}`);
   }
   return parsed;
 }
-
-export type CloudOAuthConfig = GDriveProviderConfig | OneDriveProviderConfig;

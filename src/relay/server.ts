@@ -1,21 +1,37 @@
 /**
  * PolyVault free-tier relay — deploy on Oracle Always Free (or any small VM).
  *
- * Receives: presigned hub GET URL + destination credentials
- * Does:     hub → Drive / OneDrive / S3 push without using the user's laptop.
+ * One hub pull → many destinations in parallel, with retries and
+ * skip-if-same-size.
  *
  *   RELAY_TOKEN=... PORT=8787 npm run relay
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createProvider } from "../providers/index.js";
 import type { ProviderConfig } from "../config/types.js";
+import { withRetry } from "../util/retry.js";
 
 interface ReplicateBody {
   sourceUrl: string;
   remotePath: string;
   size?: number;
   contentType?: string;
-  destination: ProviderConfig;
+  /** @deprecated single destination — prefer destinations[] */
+  destination?: ProviderConfig;
+  destinations?: ProviderConfig[];
+  options?: {
+    retries?: number;
+    skipIfSameSize?: boolean;
+  };
+}
+
+export interface RelayDestResult {
+  name: string;
+  kind: string;
+  ok: boolean;
+  skipped?: boolean;
+  destination?: string;
+  error?: string;
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -41,28 +57,115 @@ function authorize(req: IncomingMessage, token: string): boolean {
   return header === `Bearer ${token}`;
 }
 
+async function pushOne(
+  dest: ProviderConfig,
+  remotePath: string,
+  buffer: Buffer,
+  contentType: string | undefined,
+  opts: { retries: number; skipIfSameSize: boolean },
+): Promise<RelayDestResult> {
+  try {
+    const provider = createProvider(dest);
+
+    if (opts.skipIfSameSize && provider.headObject) {
+      const head = await provider.headObject(remotePath);
+      if (head && head.size === buffer.length) {
+        return {
+          name: dest.name,
+          kind: dest.kind,
+          ok: true,
+          skipped: true,
+          destination: `${provider.describeDestination()} (skipped, same size)`,
+        };
+      }
+    }
+
+    const result = await withRetry(
+      () =>
+        provider.putObject({
+          remotePath,
+          body: buffer,
+          size: buffer.length,
+          contentType,
+        }),
+      { attempts: opts.retries, label: dest.name },
+    );
+
+    return {
+      name: dest.name,
+      kind: dest.kind,
+      ok: true,
+      skipped: result.skipped,
+      destination: result.destination,
+    };
+  } catch (err) {
+    return {
+      name: dest.name,
+      kind: dest.kind,
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 async function handleReplicate(body: ReplicateBody): Promise<{
-  ok: true;
-  destination: string;
+  ok: boolean;
+  results: RelayDestResult[];
+  /** Back-compat for single-destination clients */
+  destination?: string;
+  error?: string;
 }> {
-  if (!body.sourceUrl || !body.remotePath || !body.destination) {
-    throw new Error("sourceUrl, remotePath, and destination are required");
+  if (!body.sourceUrl || !body.remotePath) {
+    throw new Error("sourceUrl and remotePath are required");
   }
 
-  const pull = await fetch(body.sourceUrl);
-  if (!pull.ok) {
-    throw new Error(`Failed to pull hub object: HTTP ${pull.status}`);
+  const destinations =
+    body.destinations && body.destinations.length > 0
+      ? body.destinations
+      : body.destination
+        ? [body.destination]
+        : [];
+
+  if (destinations.length === 0) {
+    throw new Error("destinations[] (or destination) is required");
   }
+
+  const pull = await withRetry(async () => {
+    const res = await fetch(body.sourceUrl);
+    if (!res.ok) {
+      throw new Error(`Failed to pull hub object: HTTP ${res.status}`);
+    }
+    return res;
+  }, { attempts: 3 });
+
   const buffer = Buffer.from(await pull.arrayBuffer());
-  const provider = createProvider(body.destination);
-  const result = await provider.putObject({
-    remotePath: body.remotePath,
-    body: buffer,
-    size: body.size ?? buffer.length,
-    contentType:
-      body.contentType ?? pull.headers.get("content-type") ?? undefined,
-  });
-  return { ok: true, destination: result.destination };
+  const contentType =
+    body.contentType ?? pull.headers.get("content-type") ?? undefined;
+  const retries = body.options?.retries ?? 3;
+  const skipIfSameSize = body.options?.skipIfSameSize ?? true;
+
+  // One hub download → fan-out in parallel
+  const results = await Promise.all(
+    destinations.map((dest) =>
+      pushOne(dest, body.remotePath, buffer, contentType, {
+        retries,
+        skipIfSameSize,
+      }),
+    ),
+  );
+
+  const ok = results.every((r) => r.ok);
+  return {
+    ok,
+    results,
+    destination: results[0]?.destination,
+    error: ok
+      ? undefined
+      : results
+          .filter((r) => !r.ok)
+          .map((r) => `${r.name}: ${r.error}`)
+          .join("; "),
+  };
 }
 
 export function startRelayServer(options?: {
@@ -91,7 +194,7 @@ export function startRelayServer(options?: {
         const raw = await readBody(req);
         const body = JSON.parse(raw) as ReplicateBody;
         const result = await handleReplicate(body);
-        json(res, 200, result);
+        json(res, result.ok ? 200 : 207, result);
         return;
       }
 
@@ -99,7 +202,7 @@ export function startRelayServer(options?: {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error("relay error:", message);
-      json(res, 500, { ok: false, error: message });
+      json(res, 500, { ok: false, error: message, results: [] });
     }
   });
 

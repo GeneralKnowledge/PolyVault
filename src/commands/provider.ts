@@ -8,7 +8,11 @@ import {
   setRelay,
 } from "../config/store.js";
 import type { ProviderKind } from "../config/types.js";
-import { linkGoogleDrive, linkOneDrive } from "../providers/index.js";
+import {
+  linkDropbox,
+  linkGoogleDrive,
+  linkOneDrive,
+} from "../providers/index.js";
 import { resolveLocalPath } from "../util/path.js";
 import { prompt, promptRequired } from "../util/prompt.js";
 
@@ -28,6 +32,9 @@ type AddFlags = {
   clientId?: string;
   clientSecret?: string;
   tenant?: string;
+  baseUrl?: string;
+  username?: string;
+  password?: string;
 };
 
 async function buildProvider(kind: ProviderKind, flags: AddFlags) {
@@ -102,6 +109,38 @@ async function buildProvider(kind: ProviderKind, flags: AddFlags) {
         openBrowser,
       });
     }
+    case "dropbox": {
+      const name = flags.name ?? (await prompt("Provider name", "dropbox"));
+      const clientId =
+        flags.clientId ?? (await promptRequired("Dropbox app key"));
+      const clientSecret =
+        flags.clientSecret ?? (await promptRequired("Dropbox app secret"));
+      return linkDropbox({
+        name,
+        clientId,
+        clientSecret,
+        openBrowser,
+      });
+    }
+    case "webdav": {
+      const name = flags.name ?? (await prompt("Provider name", "webdav"));
+      const baseUrl =
+        flags.baseUrl ??
+        (await promptRequired(
+          "WebDAV base URL (e.g. https://cloud.example/remote.php/dav/files/user)",
+        ));
+      const username =
+        flags.username ?? (await promptRequired("WebDAV username"));
+      const password =
+        flags.password ?? (await promptRequired("WebDAV password"));
+      return {
+        kind: "webdav" as const,
+        name,
+        baseUrl,
+        username,
+        password,
+      };
+    }
   }
 }
 
@@ -130,7 +169,14 @@ export async function runProviderAdd(
   kind: string,
   flags: AddFlags,
 ): Promise<void> {
-  const valid: ProviderKind[] = ["local", "s3", "gdrive", "onedrive"];
+  const valid: ProviderKind[] = [
+    "local",
+    "s3",
+    "gdrive",
+    "onedrive",
+    "dropbox",
+    "webdav",
+  ];
   if (!valid.includes(kind as ProviderKind)) {
     throw new Error(
       `Unknown provider kind "${kind}". Expected one of: ${valid.join(", ")}`,
@@ -145,14 +191,19 @@ export async function runProviderAdd(
   const provider = await buildProvider(kind as ProviderKind, flags);
   await addReplica(provider);
   console.log(`Added replica "${provider.name}" [${provider.kind}]`);
-  if (provider.kind === "gdrive") {
+  if (
+    provider.kind === "gdrive" ||
+    provider.kind === "dropbox" ||
+    provider.kind === "webdav" ||
+    provider.kind === "s3"
+  ) {
     console.log(
-      "Tip: configure Oracle Always Free relay (`polyvault relay set`) so Drive uses mode=relay (see docs/SETUP.md).",
+      "Tip: cloud replicas fan out via Oracle Always Free relay (one R2 pull → many pushes). See docs/SETUP.md.",
     );
   }
   if (provider.kind === "onedrive") {
     console.log(
-      "Tip: with an R2 hub, OneDrive Personal uses URL-pull (Microsoft fetches from R2). See docs/SETUP.md.",
+      "Tip: with an R2 hub, OneDrive Personal uses URL-pull; otherwise it joins the relay batch.",
     );
   }
 }
@@ -192,6 +243,8 @@ function printOne(
     endpoint?: string;
     clientId?: string;
     tenant?: string;
+    baseUrl?: string;
+    username?: string;
   },
   suffix: string,
 ): void {
@@ -214,6 +267,18 @@ function printOne(
         `  • ${p.name}  [onedrive]  clientId=${(p.clientId ?? "").slice(0, 12)}…  tenant=${p.tenant ?? "common"}${suffix}`,
       );
       break;
+    case "dropbox":
+      console.log(
+        `  • ${p.name}  [dropbox]  clientId=${(p.clientId ?? "").slice(0, 12)}…${suffix}`,
+      );
+      break;
+    case "webdav":
+      console.log(
+        `  • ${p.name}  [webdav]  ${p.baseUrl}  user=${p.username}${suffix}`,
+      );
+      break;
+    default:
+      console.log(`  • ${p.name}  [${p.kind}]${suffix}`);
   }
 }
 
@@ -227,7 +292,7 @@ export async function runRelaySet(options: {
   await setRelay({ url: options.url.replace(/\/+$/, ""), token });
   console.log(`Relay set to ${options.url}`);
   console.log(
-    "Puts will ask this relay to stream hub → Drive/OneDrive off your laptop.",
+    "Puts fan out hub → many clouds on this relay (one pull, parallel pushes).",
   );
 }
 

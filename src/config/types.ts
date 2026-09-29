@@ -1,4 +1,10 @@
-export type ProviderKind = "local" | "s3" | "gdrive" | "onedrive";
+export type ProviderKind =
+  | "local"
+  | "s3"
+  | "gdrive"
+  | "onedrive"
+  | "dropbox"
+  | "webdav";
 
 export interface LocalProviderConfig {
   kind: "local";
@@ -38,13 +44,33 @@ export interface OneDriveProviderConfig {
   tenant?: string;
 }
 
+export interface DropboxProviderConfig {
+  kind: "dropbox";
+  name: string;
+  clientId: string;
+  clientSecret: string;
+  refreshToken: string;
+  accessToken?: string;
+  expiresAt?: number;
+}
+
+export interface WebDavProviderConfig {
+  kind: "webdav";
+  name: string;
+  baseUrl: string;
+  username: string;
+  password: string;
+}
+
 export type ProviderConfig =
   | LocalProviderConfig
   | S3ProviderConfig
   | GDriveProviderConfig
-  | OneDriveProviderConfig;
+  | OneDriveProviderConfig
+  | DropboxProviderConfig
+  | WebDavProviderConfig;
 
-/** Optional free-tier relay that streams hub → Drive/OneDrive off-laptop. */
+/** Optional free-tier relay that streams hub → many clouds off-laptop. */
 export interface RelayConfig {
   url: string;
   /** Present only after secrets merge. */
@@ -56,7 +82,8 @@ export type ReplicateMode =
   | "relay"
   | "onedrive-url-pull"
   | "hub-copy"
-  | "laptop-bridge";
+  | "laptop-bridge"
+  | "skipped";
 
 export interface PutResultRecord {
   at: string;
@@ -133,4 +160,15 @@ export function migrateConfig(
 
 export function allProviders(config: PolyVaultConfig): ProviderConfig[] {
   return config.hub ? [config.hub, ...config.replicas] : [...config.replicas];
+}
+
+/** Cloud destinations that should leave the laptop via URL-pull or relay. */
+export function isCloudReplica(kind: ProviderKind): boolean {
+  return (
+    kind === "s3" ||
+    kind === "gdrive" ||
+    kind === "onedrive" ||
+    kind === "dropbox" ||
+    kind === "webdav"
+  );
 }

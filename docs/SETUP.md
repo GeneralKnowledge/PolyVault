@@ -262,6 +262,33 @@ Approve in the browser. On `put`, expect mode **`onedrive-url-pull`** when the h
 
 ---
 
+## Relay fan-out (many destinations)
+
+With a relay configured, one `put` asks the VM to:
+
+1. Download the object **once** from the R2 signed URL  
+2. Push in **parallel** to every cloud replica that needs the relay (Drive, Dropbox, WebDAV, extra S3, OneDrive if URL-pull fails)  
+3. **Retry** failed pushes (3 attempts)  
+4. **Skip** a destination if an object with the same size already exists  
+
+OneDrive Personal still prefers **URL-pull** (Microsoft fetches R2). Cloud replicas without a relay fail unless you pass `--bridge`.
+
+### Extra replicas
+
+```bash
+polyvault provider add dropbox --name dropbox --client-id … --client-secret …
+polyvault provider add webdav --name nextcloud \
+  --base-url https://cloud.example/remote.php/dav/files/alice \
+  --username alice --password 'app-password'
+polyvault provider add s3 --name b2 …   # another bucket via relay
+```
+
+Dropbox: create an app at [https://www.dropbox.com/developers/apps](https://www.dropbox.com/developers/apps) (Scoped access, Full Dropbox), enable `files.content.write` / `files.content.read`, add redirect `http://127.0.0.1:8765/callback`.
+
+WebDAV: use any server that speaks basic PUT/MKCOL (Nextcloud “WebDAV” URL + app password is common).
+
+---
+
 ## 5. End-to-end checklist
 
 ```bash
@@ -271,6 +298,8 @@ polyvault hub set s3 …                 # §1 R2
 polyvault relay set --url http://IP:8787 --token …
 polyvault provider add gdrive …        # §3
 polyvault provider add onedrive …      # §4
+polyvault provider add dropbox …       # optional
+polyvault provider add webdav …        # optional
 
 echo 'hello from polyvault' > hello.txt
 polyvault put hello.txt
@@ -283,8 +312,9 @@ Expected modes:
 |-------------|------|
 | R2 | `hub-upload` |
 | OneDrive Personal | `onedrive-url-pull` |
-| Google Drive | `relay` |
-| (missing relay / signed URL) | `laptop-bridge` (avoid) |
+| Google Drive / Dropbox / WebDAV / extra S3 | `relay` (parallel on VM) |
+| Already present (same size) | `skipped` |
+| Cloud without relay (and no `--bridge`) | fails with SETUP tip |
 
 ---
 
@@ -296,6 +326,7 @@ Expected modes:
 | Oracle “Out of capacity” | Retry AD / smaller shape / different time; AMD micro VMs are an alternative. |
 | Google `redirect_uri_mismatch` | URI must be exactly `http://127.0.0.1:8765/callback`. |
 | Google blocked / unverified app | Add yourself as test user on the consent screen. |
-| OneDrive URL-pull fails | Personal preview only; set relay so mode becomes `relay`. |
+| OneDrive URL-pull fails | Personal preview only; set relay so it joins the fan-out batch. |
 | Relay 401 | `RELAY_TOKEN` on VM must match `polyvault relay set --token`. |
 | Relay can’t reach R2 URL | VM needs outbound HTTPS; security list egress usually open by default. |
+| Cloud replica fails without relay | Run Oracle relay + `relay set`, or pass `--bridge` (uses your laptop). |

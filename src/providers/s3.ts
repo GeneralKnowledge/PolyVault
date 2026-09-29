@@ -2,6 +2,7 @@ import {
   CreateBucketCommand,
   GetObjectCommand,
   HeadBucketCommand,
+  HeadObjectCommand,
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
@@ -11,6 +12,7 @@ import type { S3ProviderConfig } from "../config/types.js";
 import type {
   CloudProvider,
   GetObjectResult,
+  HeadObjectResult,
   PutObjectInput,
   PutObjectResult,
 } from "./types.js";
@@ -94,6 +96,21 @@ export class S3Provider implements CloudProvider {
       size: body.length,
       contentType: res.ContentType,
     };
+  }
+
+  async headObject(remotePath: string): Promise<HeadObjectResult | null> {
+    const key = remotePath.replace(/^\/+/, "");
+    try {
+      const res = await this.client.send(
+        new HeadObjectCommand({ Bucket: this.bucket, Key: key }),
+      );
+      if (typeof res.ContentLength === "number") {
+        return { size: res.ContentLength };
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   /** Presigned GET so OneDrive/relay can pull from the hub without laptop bytes. */

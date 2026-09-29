@@ -61,7 +61,9 @@ provider
 
 provider
   .command("add")
-  .description("Add a replica (local | s3 | gdrive | onedrive)")
+  .description(
+    "Add a replica (local | s3 | gdrive | onedrive | dropbox | webdav)",
+  )
   .argument("<kind>", "Provider kind")
   .option("--name <name>", "Provider display name")
   .option("--path <path>", "Local filesystem path (local)")
@@ -71,9 +73,12 @@ provider
   .option("--access-key-id <key>", "S3 access key ID")
   .option("--secret-access-key <secret>", "S3 secret access key")
   .option("--force-path-style", "Use path-style S3 URLs", true)
-  .option("--client-id <id>", "OAuth client ID (gdrive/onedrive)")
-  .option("--client-secret <secret>", "OAuth client secret")
+  .option("--client-id <id>", "OAuth client ID / Dropbox app key")
+  .option("--client-secret <secret>", "OAuth client secret / Dropbox app secret")
   .option("--tenant <tenant>", "Microsoft tenant (onedrive)", "common")
+  .option("--base-url <url>", "WebDAV base URL")
+  .option("--username <user>", "WebDAV username")
+  .option("--password <pass>", "WebDAV password")
   .action(async (kind: string, opts: Record<string, unknown>) => {
     await runProviderAdd(kind, opts as never);
   });

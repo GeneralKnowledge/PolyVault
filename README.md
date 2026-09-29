@@ -5,107 +5,58 @@ Upload a file **once** to a **free Cloudflare R2 hub**. Replicas are filled from
 ```text
 laptop ──(once)──► R2 hub (free)
                       ├── URL-pull ──► OneDrive Personal
-                      └── Oracle Always Free relay ──► Google Drive (+ more)
+                      └── Oracle Always Free relay ──► Drive, Dropbox, WebDAV, more S3, …
+                            (one hub pull → many parallel pushes, retries, skip-if-same-size)
 ```
 
 ```bash
 polyvault put ./hello.txt
 ```
 
-**Full signup + wire-up instructions for every service:** [docs/SETUP.md](docs/SETUP.md)
+**Signup + wire-up for each service:** [docs/SETUP.md](docs/SETUP.md)
 
-## Architecture (preferred)
+## Architecture
 
-| Piece | Service | Why |
-|--------|---------|-----|
-| Hub | **Cloudflare R2** | Free 10 GB + free egress; original lands here once |
-| OneDrive | **URL-pull** | Microsoft fetches from an R2 signed URL (no laptop, no relay) |
-| Google Drive (+ future) | **Oracle Always Free relay** | One free VM can push hub → many clouds |
-| Fallback | Laptop bridge | Only if relay/URL-pull missing (prints a warning) |
+| Piece | Service | Role |
+|--------|---------|------|
+| Hub | **Cloudflare R2** | Original lands once (free egress) |
+| OneDrive | **URL-pull** | Microsoft fetches R2 |
+| Other clouds | **Oracle Always Free relay** | One pull → N parallel pushes |
+| Local folders | **hub-copy** | Copy/pull from hub; skip if same size |
+| Fallback | `--bridge` | Explicit laptop transit for clouds (off by default) |
 
 ## Install
 
 ```bash
-npm install
-npm run build
-npm link   # optional
+npm install && npm run build
 ```
 
-Config: `~/.polyvault/` (`POLYVAULT_HOME` override). Secrets mode `0600`.
+## Quickstart
 
-## Quickstart (after SETUP.md accounts exist)
+See [docs/SETUP.md](docs/SETUP.md), then:
 
 ```bash
 polyvault init
-
-polyvault hub set s3 \
-  --name r2 \
-  --endpoint https://<ACCOUNT_ID>.r2.cloudflarestorage.com \
-  --region auto \
-  --bucket polyvault \
-  --access-key-id <KEY> \
-  --secret-access-key <SECRET>
-
-# On Oracle VM: npm run relay:prod  (see docs/SETUP.md)
-polyvault relay set --url http://YOUR_VM_IP:8787 --token <RELAY_TOKEN>
-
-polyvault provider add onedrive --name onedrive \
-  --client-id <APP_ID> --client-secret <SECRET> --tenant common
-
-polyvault provider add gdrive --name gdrive \
-  --client-id <CLIENT_ID> --client-secret <CLIENT_SECRET>
-
-echo 'hi' > hello.txt
+polyvault hub set s3 …                 # R2
+polyvault relay set --url http://VM:8787 --token …
+polyvault provider add onedrive …
+polyvault provider add gdrive …
+polyvault provider add dropbox …       # optional
+polyvault provider add webdav …        # optional
 polyvault put hello.txt
-polyvault status
-```
-
-Expected modes: `hub-upload` (R2), `onedrive-url-pull`, `relay` (Drive).
-
-## Local test (no cloud)
-
-```bash
-polyvault init
-polyvault hub set local --name hub --path /tmp/pv-hub
-polyvault provider add local --name replica --path /tmp/pv-replica
-polyvault put hello.txt   # modes: hub-upload + hub-copy
 ```
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `polyvault init` | Create config |
-| `polyvault hub set s3\|local` | Set hub (R2 recommended) |
-| `polyvault provider add <kind>` | Add replica (`local`, `s3`, `gdrive`, `onedrive`) |
-| `polyvault provider list` | Hub + replicas + relay |
-| `polyvault relay set --url …` | Point at Oracle (or other) relay VM |
-| `polyvault relay clear` | Remove relay |
-| `polyvault put <file>` | Upload once to hub; replicate |
-| `polyvault status` | Show last put modes |
+| `hub set s3\|local` | Free hub |
+| `provider add <kind>` | `local`, `s3`, `gdrive`, `onedrive`, `dropbox`, `webdav` |
+| `relay set --url …` | Free VM that fans out hub → many |
+| `put <file>` | Upload once; replicate |
+| `put --bridge` | Allow laptop-bridge for clouds (debug) |
 
-`put` options: `--to`, `--remote-dir`, `--bridge` (force laptop bridge).
-
-OAuth redirect URI (Google + Microsoft):
-
-```text
-http://127.0.0.1:8765/callback
-```
-
-## Relay
-
-```bash
-# on the free VM
-RELAY_TOKEN=… PORT=8787 npm run relay:prod
-```
-
-`POST /v1/replicate` with bearer token; body includes R2 signed `sourceUrl` + destination credentials. `GET /health` for checks.
-
-## Roadmap
-
-- More replicas (Dropbox, Mega, WebDAV) via the same relay
-- Encryption before hub upload
-- Hardened relay (mTLS, streaming without full buffer)
+OAuth redirect: `http://127.0.0.1:8765/callback`
 
 ## License
 
