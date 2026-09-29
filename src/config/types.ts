@@ -53,6 +53,7 @@ export interface PutResultRecord {
     kind: ProviderKind;
     ok: boolean;
     remotePath?: string;
+    destination?: string;
     error?: string;
   }>;
 }

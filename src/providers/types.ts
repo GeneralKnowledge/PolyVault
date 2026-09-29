@@ -11,11 +11,15 @@ export interface PutObjectInput {
 
 export interface PutObjectResult {
   remotePath: string;
+  /** Concrete destination for this provider (absolute path, s3 URI, etc.). */
+  destination: string;
 }
 
 export interface CloudProvider {
   readonly kind: ProviderKind;
   readonly name: string;
+  /** Human-readable destination root (folder, bucket, drive account). */
+  describeDestination(): string;
   putObject(input: PutObjectInput): Promise<PutObjectResult>;
 }
 

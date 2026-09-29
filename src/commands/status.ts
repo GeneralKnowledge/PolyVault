@@ -28,9 +28,11 @@ export async function runStatus(): Promise<void> {
     console.log(`  file:      ${lp.file}`);
     console.log(`  remoteDir: ${lp.remoteDir}`);
     for (const r of lp.results) {
-      console.log(
-        `  ${r.ok ? "✓" : "✗"} ${r.name}: ${r.ok ? r.remotePath : r.error}`,
-      );
+      if (r.ok) {
+        console.log(`  ✓ ${r.name}: ${r.destination ?? r.remotePath}`);
+      } else {
+        console.log(`  ✗ ${r.name}: ${r.error}`);
+      }
     }
   } else {
     console.log("\nNo puts recorded yet.");

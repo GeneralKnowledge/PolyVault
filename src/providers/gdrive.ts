@@ -110,6 +110,10 @@ export class GDriveProvider implements CloudProvider {
     this.config = config;
   }
 
+  describeDestination(): string {
+    return "Google Drive (My Drive)";
+  }
+
   private async ensureAccessToken(): Promise<string> {
     if (
       this.config.accessToken &&
@@ -261,6 +265,9 @@ export class GDriveProvider implements CloudProvider {
       throw new Error(`Google Drive upload failed: ${await res.text()}`);
     }
 
-    return { remotePath: input.remotePath };
+    return {
+      remotePath: input.remotePath,
+      destination: `gdrive://${input.remotePath}`,
+    };
   }
 }

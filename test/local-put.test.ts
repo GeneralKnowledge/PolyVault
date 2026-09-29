@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -25,13 +25,14 @@ describe("LocalProvider", () => {
         name: "t",
         path: root,
       });
-      await provider.putObject({
+      const result = await provider.putObject({
         remotePath: "PolyVault/hello.txt",
         body: Buffer.from("hi\n"),
         size: 3,
       });
       const content = await readFile(join(root, "PolyVault", "hello.txt"), "utf8");
       assert.equal(content, "hi\n");
+      assert.equal(result.destination, join(root, "PolyVault", "hello.txt"));
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -49,7 +50,7 @@ describe("put fan-out", () => {
     home = await mkdtemp(join(tmpdir(), "pv-home-"));
     destA = join(home, "a");
     destB = join(home, "b");
-    destBad = join(home, "missing-parent", "nope"); // we'll point at a file-as-dir later
+    destBad = join(home, "missing-parent", "nope");
     await mkdir(destA, { recursive: true });
     await mkdir(destB, { recursive: true });
     prevHome = process.env.POLYVAULT_HOME;
@@ -65,27 +66,65 @@ describe("put fan-out", () => {
     await rm(home, { recursive: true, force: true });
   });
 
-  it("uploads to all local providers", async () => {
+  it("one put fans out to distinct destinations (not the same path twice)", async () => {
+    const rootA = await realpath(destA);
+    const rootB = await realpath(destB);
+    assert.notEqual(rootA, rootB, "test destinations must be different folders");
+
     const file = join(home, "hello.txt");
-    await writeFile(file, "hi\n");
+    const payload = `unique-${Date.now()}\n`;
+    await writeFile(file, payload);
+
     const outcomes = await runPut(file, {});
     assert.equal(outcomes.length, 2);
     assert.ok(outcomes.every((o) => o.ok));
-    assert.equal(
-      await readFile(join(destA, "PolyVault", "hello.txt"), "utf8"),
-      "hi\n",
-    );
-    assert.equal(
-      await readFile(join(destB, "PolyVault", "hello.txt"), "utf8"),
-      "hi\n",
-    );
+
+    const pathA = join(destA, "PolyVault", "hello.txt");
+    const pathB = join(destB, "PolyVault", "hello.txt");
+    assert.notEqual(await realpath(pathA), await realpath(pathB));
+    assert.equal(await readFile(pathA, "utf8"), payload);
+    assert.equal(await readFile(pathB, "utf8"), payload);
+
+    // Each outcome reports a different concrete destination
+    const destinations = outcomes.map((o) => o.destination);
+    assert.equal(new Set(destinations).size, 2);
+    assert.ok(destinations.every((d) => d && (d.includes(rootA) || d.includes(rootB))));
+
     const cfg = await loadConfig();
     assert.ok(cfg.lastPut);
     assert.equal(cfg.lastPut?.results.length, 2);
+    assert.equal(
+      new Set(cfg.lastPut?.results.map((r) => r.destination)).size,
+      2,
+    );
+  });
+
+  it("rejects put when two providers share the same destination", async () => {
+    const dupHome = await mkdtemp(join(tmpdir(), "pv-dup-"));
+    const prev = process.env.POLYVAULT_HOME;
+    try {
+      process.env.POLYVAULT_HOME = dupHome;
+      await initConfig();
+      const shared = join(dupHome, "shared");
+      await mkdir(shared, { recursive: true });
+      await addProvider({ kind: "local", name: "one", path: shared });
+      await addProvider({ kind: "local", name: "two", path: shared });
+      const file = join(dupHome, "x.txt");
+      await writeFile(file, "x\n");
+      await assert.rejects(
+        () => runPut(file, {}),
+        /same destination/,
+      );
+    } finally {
+      if (prev === undefined) delete process.env.POLYVAULT_HOME;
+      else process.env.POLYVAULT_HOME = prev;
+      await rm(dupHome, { recursive: true, force: true });
+      // restore suite home for remaining tests
+      process.env.POLYVAULT_HOME = home;
+    }
   });
 
   it("isolates failures and continues other providers", async () => {
-    // Make destBad a regular file so mkdir of child path fails
     const blocker = join(home, "blocker");
     await writeFile(blocker, "not-a-dir");
     await addProvider({

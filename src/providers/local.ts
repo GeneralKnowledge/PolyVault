@@ -16,6 +16,10 @@ export class LocalProvider implements CloudProvider {
     this.root = config.path;
   }
 
+  describeDestination(): string {
+    return this.root;
+  }
+
   async putObject(input: PutObjectInput): Promise<PutObjectResult> {
     const dest = join(this.root, ...input.remotePath.split("/").filter(Boolean));
     await mkdir(dirname(dest), { recursive: true });
@@ -24,6 +28,6 @@ export class LocalProvider implements CloudProvider {
       Buffer.isBuffer(input.body) ? Readable.from(input.body) : input.body;
 
     await pipeline(body, createWriteStream(dest));
-    return { remotePath: input.remotePath };
+    return { remotePath: input.remotePath, destination: dest };
   }
 }

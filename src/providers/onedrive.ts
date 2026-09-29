@@ -103,6 +103,10 @@ export class OneDriveProvider implements CloudProvider {
     this.config = config;
   }
 
+  describeDestination(): string {
+    return "OneDrive (me/drive)";
+  }
+
   private async ensureAccessToken(): Promise<string> {
     if (
       this.config.accessToken &&
@@ -172,7 +176,10 @@ export class OneDriveProvider implements CloudProvider {
       if (!res.ok) {
         throw new Error(`OneDrive upload failed: ${await res.text()}`);
       }
-      return { remotePath: input.remotePath };
+      return {
+        remotePath: input.remotePath,
+        destination: `onedrive:///${remotePath}`,
+      };
     }
 
     const sessionRes = await fetch(
@@ -217,6 +224,9 @@ export class OneDriveProvider implements CloudProvider {
       offset = end;
     }
 
-    return { remotePath: input.remotePath };
+    return {
+      remotePath: input.remotePath,
+      destination: `onedrive:///${remotePath}`,
+    };
   }
 }

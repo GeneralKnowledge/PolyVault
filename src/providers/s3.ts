@@ -22,10 +22,12 @@ export class S3Provider implements CloudProvider {
   readonly name: string;
   private readonly client: S3Client;
   private readonly bucket: string;
+  private readonly endpoint: string;
 
   constructor(config: S3ProviderConfig) {
     this.name = config.name;
     this.bucket = config.bucket;
+    this.endpoint = config.endpoint;
     this.client = new S3Client({
       region: config.region || "auto",
       endpoint: config.endpoint,
@@ -35,6 +37,10 @@ export class S3Provider implements CloudProvider {
         secretAccessKey: config.secretAccessKey,
       },
     });
+  }
+
+  describeDestination(): string {
+    return `s3://${this.bucket} @ ${this.endpoint}`;
   }
 
   async putObject(input: PutObjectInput): Promise<PutObjectResult> {
@@ -61,7 +67,10 @@ export class S3Provider implements CloudProvider {
       throw err;
     }
 
-    return { remotePath: key };
+    return {
+      remotePath: key,
+      destination: `s3://${this.bucket}/${key}`,
+    };
   }
 
   /** Optional helper used in tests / setup docs — create bucket if missing. */

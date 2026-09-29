@@ -6,7 +6,9 @@ Upload a file **once**; store it on **multiple free cloud providers** in paralle
 polyvault put ./hello.txt
 ```
 
-`hello.txt` appears in every linked destination (local folders, S3-compatible, Google Drive, OneDrive) under a shared remote folder (default `PolyVault/`).
+`hello.txt` appears in every **distinct** linked destination (local folders, S3-compatible, Google Drive, OneDrive) under a shared remote folder (default `PolyVault/`).
+
+One `polyvault put` reads the local file and fans out in parallel — you do not run upload once per cloud. V1 still uses your network once per destination (cloud-to-cloud relay is roadmap). PolyVault refuses a put if two linked providers resolve to the same destination, so you cannot accidentally upload the same file twice to one place.
 
 ## Requirements
 
