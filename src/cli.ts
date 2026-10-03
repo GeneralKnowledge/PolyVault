@@ -16,9 +16,9 @@ const program = new Command();
 program
   .name("polyvault")
   .description(
-    "Upload once to a free R2/S3 hub; replicate to Drive/OneDrive/etc. via URL-pull or relay.",
+    "Upload once to a free R2/S3 hub; fan out to Drive/OneDrive/Dropbox/etc. via a free-tier relay.",
   )
-  .version("0.2.0");
+  .version("0.3.0");
 
 program
   .command("init")
@@ -106,18 +106,29 @@ relay
 program
   .command("put")
   .description(
-    "Upload original once to hub; replicate to replicas (relay / URL-pull / hub-copy)",
+    "Upload original once to hub; replicate to replicas (relay / hub-copy)",
   )
   .argument("<file>", "Local file to upload")
   .option("--to <names>", "Comma-separated replica names")
   .option("--remote-dir <dir>", "Remote folder (default: PolyVault)")
   .option("--bridge", "Force laptop-bridge replication (debug)")
+  .option("--dry-run", "Show the hub → replica plan without uploading")
   .action(
     async (
       file: string,
-      opts: { to?: string; remoteDir?: string; bridge?: boolean },
+      opts: {
+        to?: string;
+        remoteDir?: string;
+        bridge?: boolean;
+        dryRun?: boolean;
+      },
     ) => {
-      const outcomes = await runPut(file, opts);
+      const outcomes = await runPut(file, {
+        to: opts.to,
+        remoteDir: opts.remoteDir,
+        bridge: opts.bridge,
+        dryRun: opts.dryRun,
+      });
       if (outcomes.some((o) => !o.ok)) {
         process.exitCode = 1;
       }

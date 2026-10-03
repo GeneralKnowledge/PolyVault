@@ -193,17 +193,13 @@ export async function runProviderAdd(
   console.log(`Added replica "${provider.name}" [${provider.kind}]`);
   if (
     provider.kind === "gdrive" ||
+    provider.kind === "onedrive" ||
     provider.kind === "dropbox" ||
     provider.kind === "webdav" ||
     provider.kind === "s3"
   ) {
     console.log(
       "Tip: cloud replicas fan out via Oracle Always Free relay (one R2 pull → many pushes). See docs/SETUP.md.",
-    );
-  }
-  if (provider.kind === "onedrive") {
-    console.log(
-      "Tip: with an R2 hub, OneDrive Personal uses URL-pull; otherwise it joins the relay batch.",
     );
   }
 }

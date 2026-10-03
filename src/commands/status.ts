@@ -11,6 +11,13 @@ export async function runStatus(): Promise<void> {
   );
   console.log(`Replicas:       ${config.replicas.length}`);
   console.log(`Relay:          ${config.relay?.url ?? "(not set)"}`);
+  if (!config.hub) {
+    console.log("\nTip: set a free R2 hub — polyvault hub set s3 … (docs/SETUP.md)");
+  } else if (config.replicas.some((r) => r.kind !== "local") && !config.relay?.url) {
+    console.log(
+      "\nTip: cloud replicas need a free-tier relay — polyvault relay set … (docs/SETUP.md)",
+    );
+  }
 
   if (config.hub) {
     console.log("");

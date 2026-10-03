@@ -10,7 +10,6 @@ import type {
 import { isCloudReplica } from "../config/types.js";
 import { createProvider, LocalProvider, S3Provider } from "../providers/index.js";
 import type { CloudProvider } from "../providers/types.js";
-import { OneDriveProvider } from "../providers/onedrive.js";
 import { replicateViaRelay } from "../relay/client.js";
 import { buildRemotePath } from "../util/path.js";
 
@@ -19,6 +18,8 @@ export interface PutOptions {
   remoteDir?: string;
   /** Allow laptop-bridge for cloud replicas (debug / no relay). */
   bridge?: boolean;
+  /** Plan the put without uploading or replicating (inspired by syncerman dry-run). */
+  dryRun?: boolean;
 }
 
 export interface ProviderPutOutcome {
@@ -109,6 +110,54 @@ function selectReplicas(
   return all.filter((p) => names.includes(p.name));
 }
 
+/** Partition replicas into relay / local / laptop-bridge buckets. */
+function partitionReplicas(
+  replicas: ProviderConfig[],
+  options: {
+    bridge?: boolean;
+    hasRelay: boolean;
+    hasSignedUrl: boolean;
+  },
+): {
+  relayBatch: ProviderConfig[];
+  localCopies: ProviderConfig[];
+  bridgeNeeded: ProviderConfig[];
+} {
+  const relayBatch: ProviderConfig[] = [];
+  const localCopies: ProviderConfig[] = [];
+  const bridgeNeeded: ProviderConfig[] = [];
+
+  for (const r of replicas) {
+    if (r.kind === "local") {
+      localCopies.push(r);
+      continue;
+    }
+    if (
+      !options.bridge &&
+      options.hasRelay &&
+      options.hasSignedUrl &&
+      isCloudReplica(r.kind)
+    ) {
+      relayBatch.push(r);
+      continue;
+    }
+    bridgeNeeded.push(r);
+  }
+
+  return { relayBatch, localCopies, bridgeNeeded };
+}
+
+function plannedMode(
+  replica: ProviderConfig,
+  groups: ReturnType<typeof partitionReplicas>,
+  options: { bridge?: boolean },
+): ReplicateMode | "blocked" {
+  if (groups.localCopies.includes(replica)) return "hub-copy";
+  if (groups.relayBatch.includes(replica)) return "relay";
+  if (options.bridge || !isCloudReplica(replica.kind)) return "laptop-bridge";
+  return "blocked";
+}
+
 export async function runPut(
   fileArg: string,
   options: PutOptions,
@@ -127,15 +176,46 @@ export async function runPut(
   const remoteDir = options.remoteDir ?? config.defaultRemoteDir;
   const remotePath = buildRemotePath(remoteDir, filePath);
   const size = fileStat.size;
+  const hasRelay = Boolean(config.relay?.url && config.relay.token);
+  const hubIsS3 = hubConfig.kind === "s3";
 
-  console.log(`Source:     ${filePath}`);
+  console.log(`Source:     ${filePath} (${size} bytes)`);
   console.log(`Remote:     ${remotePath}`);
   console.log(`Hub:        ${hubConfig.name} [${hubConfig.kind}]`);
   console.log(
     `Replicas:   ${replicas.length ? replicas.map((r) => r.name).join(", ") : "(none)"}`,
   );
   console.log(`Relay:      ${config.relay?.url ?? "(not set)"}`);
+  if (options.dryRun) {
+    console.log(`Mode:       dry-run (no uploads)`);
+  }
   console.log("");
+
+  // Dry-run: show the free-tier plan without touching the network.
+  if (options.dryRun) {
+    const groups = partitionReplicas(replicas, {
+      bridge: options.bridge,
+      hasRelay,
+      hasSignedUrl: hubIsS3,
+    });
+    console.log("Plan (upload once → many backups):");
+    console.log(`  → hub ${hubConfig.name} [${hubConfig.kind}]  mode=hub-upload`);
+    for (const r of replicas) {
+      const mode = plannedMode(r, groups, options);
+      if (mode === "blocked") {
+        console.log(
+          `  ✗ replica ${r.name} [${r.kind}]  blocked — set relay or pass --bridge`,
+        );
+      } else {
+        console.log(`  → replica ${r.name} [${r.kind}]  mode=${mode}`);
+      }
+    }
+    const copies = 1 + replicas.length;
+    console.log(
+      `\nDry-run: would aim for ${copies} copy(ies) (1 hub + ${replicas.length} replica(s)). Nothing uploaded.`,
+    );
+    return [];
+  }
 
   const outcomes: ProviderPutOutcome[] = [];
   const hubProvider = createProvider(hubConfig);
@@ -194,83 +274,16 @@ export async function runPut(
     }
   }
 
-  // Partition replicas
-  const urlPull: ProviderConfig[] = [];
-  const relayBatch: ProviderConfig[] = [];
-  const localCopies: ProviderConfig[] = [];
-  const bridgeNeeded: ProviderConfig[] = [];
+  const { relayBatch, localCopies, bridgeNeeded } = partitionReplicas(
+    replicas,
+    {
+      bridge: options.bridge,
+      hasRelay,
+      hasSignedUrl: Boolean(signedGetUrl),
+    },
+  );
 
-  for (const r of replicas) {
-    if (r.kind === "local") {
-      localCopies.push(r);
-      continue;
-    }
-    if (
-      !options.bridge &&
-      r.kind === "onedrive" &&
-      signedGetUrl
-    ) {
-      urlPull.push(r);
-      continue;
-    }
-    if (
-      !options.bridge &&
-      config.relay?.url &&
-      config.relay.token &&
-      signedGetUrl &&
-      isCloudReplica(r.kind)
-    ) {
-      relayBatch.push(r);
-      continue;
-    }
-    bridgeNeeded.push(r);
-  }
-
-  // 2a) OneDrive URL-pull (Microsoft fetches R2)
-  for (const replicaConfig of urlPull) {
-    const started = Date.now();
-    try {
-      const replica = createProvider(replicaConfig) as OneDriveProvider;
-      const result = await replica.putFromUrl(remotePath, signedGetUrl!);
-      outcomes.push({
-        name: replicaConfig.name,
-        kind: replicaConfig.kind,
-        role: "replica",
-        mode: "onedrive-url-pull",
-        ok: true,
-        remotePath: result.remotePath,
-        destination: result.destination,
-        ms: Date.now() - started,
-      });
-      console.log(
-        `  ✓ replica ${replicaConfig.name} ← onedrive-url-pull (${Date.now() - started}ms)`,
-      );
-      console.log(`      ${result.destination}`);
-    } catch (err) {
-      // Fall through to relay batch if available
-      if (config.relay?.url && config.relay.token && signedGetUrl) {
-        console.log(
-          `  … ${replicaConfig.name}: URL-pull failed, queueing to relay`,
-        );
-        relayBatch.push(replicaConfig);
-      } else {
-        const error = err instanceof Error ? err.message : String(err);
-        outcomes.push({
-          name: replicaConfig.name,
-          kind: replicaConfig.kind,
-          role: "replica",
-          mode: "onedrive-url-pull",
-          ok: false,
-          error,
-          ms: Date.now() - started,
-        });
-        console.log(`  ✗ replica ${replicaConfig.name} FAILED (onedrive-url-pull)`);
-        console.log(`      ${error}`);
-      }
-    }
-  }
-
-  // 2b) One relay job: hub pull once → many destinations in parallel
+  // 2a) One relay job: hub pull once → many destinations in parallel
   if (relayBatch.length > 0) {
     const started = Date.now();
     console.log(
@@ -314,9 +327,7 @@ export async function runPut(
           ms: Date.now() - started,
         });
         if (r.ok) {
-          console.log(
-            `  ✓ replica ${dest.name} ← ${mode}`,
-          );
+          console.log(`  ✓ replica ${dest.name} ← ${mode}`);
           console.log(`      ${r.destination}`);
         } else {
           console.log(`  ✗ replica ${dest.name} FAILED (relay)`);
@@ -341,7 +352,7 @@ export async function runPut(
     }
   }
 
-  // 2c) Local replicas — copy from local hub, or pull from cloud hub onto disk
+  // 2b) Local replicas — copy from local hub, or pull from cloud hub onto disk
   for (const replicaConfig of localCopies) {
     const started = Date.now();
     try {
@@ -409,12 +420,12 @@ export async function runPut(
     }
   }
 
-  // 2d) Cloud without relay/URL-pull
+  // 2c) Cloud without relay (or forced --bridge)
   for (const replicaConfig of bridgeNeeded) {
     if (!options.bridge && isCloudReplica(replicaConfig.kind)) {
       const msg =
         `No off-laptop path for "${replicaConfig.name}". ` +
-        `Configure R2 hub + Oracle relay (docs/SETUP.md), or pass --bridge to force laptop transit.`;
+        `Configure an R2 hub + free-tier relay (docs/SETUP.md), or pass --bridge to force laptop transit.`;
       outcomes.push({
         name: replicaConfig.name,
         kind: replicaConfig.kind,
@@ -465,8 +476,13 @@ export async function runPut(
 
   const okCount = outcomes.filter((o) => o.ok).length;
   const failCount = outcomes.length - okCount;
+  const hubOk = outcomes.some((o) => o.role === "hub" && o.ok);
+  const replicaOk = outcomes.filter((o) => o.role === "replica" && o.ok).length;
   console.log(
-    `\nDone: original uploaded once to hub; ${okCount} place(s) OK, ${failCount} failed`,
+    `\nDone: uploaded once to hub` +
+      (hubOk ? "" : " (hub failed)") +
+      `; ${okCount} place(s) OK, ${failCount} failed` +
+      ` → ${replicaOk + (hubOk ? 1 : 0)} backup copy(ies)`,
   );
 
   await recordLastPut({
