@@ -5,23 +5,25 @@ Target architecture:
 ```text
 laptop ──(once)──► Cloudflare R2 (free hub)
                       │
-                      ├── URL-pull ──► OneDrive Personal
-                      └── Oracle Always Free relay ──► Google Drive (+ future clouds)
+                      └── Oracle Always Free relay ──► Drive, OneDrive, Dropbox, WebDAV, more S3, …
+                            (one hub pull → many parallel pushes, retries, skip-if-same-size)
 ```
 
-Do these in order: **R2 → Oracle relay → Google → Microsoft → wire PolyVault**.
+Do these in order: **R2 → Oracle relay → cloud OAuth apps → wire PolyVault**.
 
-Redirect URI used by the CLI for OAuth (Google + Microsoft):
+Redirect URI used by the CLI for OAuth (Google, Microsoft, Dropbox):
 
 ```text
 http://127.0.0.1:8765/callback
 ```
 
+Sibling projects and borrowed ideas: [RELATED.md](RELATED.md).
+
 ---
 
 ## 1. Cloudflare R2 (free hub)
 
-R2 stores the canonical copy. Free tier includes **10 GB** storage and **free egress**.
+R2 stores the canonical copy. Free tier includes **10 GB** storage and **free egress** (important: the relay can pull replicas without R2 bandwidth bills).
 
 ### Sign up
 
@@ -68,7 +70,7 @@ Official docs: [R2 S3 API](https://developers.cloudflare.com/r2/get-started/s3/)
 
 ## 2. Oracle Cloud Always Free (relay VM)
 
-The relay streams **R2 → Google Drive** (and other clouds that cannot URL-pull) so replicas do not transit your laptop.
+The relay streams **R2 → your cloud replicas** so Drive / OneDrive / Dropbox / WebDAV do not transit your laptop. Microsoft retired OneDrive “upload from URL,” so **every cloud replica uses the relay** (unless you pass `--bridge`).
 
 ### Sign up
 
@@ -215,9 +217,9 @@ With R2 hub + Oracle relay configured, `put` uses mode **`relay`** for Drive (hu
 
 ---
 
-## 4. Microsoft (OneDrive Personal replica)
+## 4. Microsoft (OneDrive replica)
 
-Needed for OneDrive. With an R2 hub, PolyVault prefers **URL-pull**: Microsoft fetches the file from an R2 signed URL (no relay hop for OneDrive).
+Needed for OneDrive. Microsoft discontinued Graph **upload from URL** in March 2024, so OneDrive is filled the same way as Drive: **relay fan-out** from the R2 hub (not laptop re-upload).
 
 ### Sign up / register an app
 
@@ -256,9 +258,7 @@ polyvault provider add onedrive --name onedrive \
   --tenant common
 ```
 
-Approve in the browser. On `put`, expect mode **`onedrive-url-pull`** when the hub is R2.
-
-> Note: Graph **upload from URL** is a **OneDrive Personal** preview feature. Work/school OneDrive may fall back to **relay** or **laptop-bridge**.
+Approve in the browser. On `put`, expect mode **`relay`** when hub + relay are configured.
 
 ---
 
@@ -267,11 +267,17 @@ Approve in the browser. On `put`, expect mode **`onedrive-url-pull`** when the h
 With a relay configured, one `put` asks the VM to:
 
 1. Download the object **once** from the R2 signed URL  
-2. Push in **parallel** to every cloud replica that needs the relay (Drive, Dropbox, WebDAV, extra S3, OneDrive if URL-pull fails)  
+2. Push in **parallel** to every cloud replica (Drive, OneDrive, Dropbox, WebDAV, extra S3)  
 3. **Retry** failed pushes (3 attempts)  
 4. **Skip** a destination if an object with the same size already exists  
 
-OneDrive Personal still prefers **URL-pull** (Microsoft fetches R2). Cloud replicas without a relay fail unless you pass `--bridge`.
+Cloud replicas without a relay fail unless you pass `--bridge` (laptop transit — fine for debugging, not the free-tier happy path).
+
+Preview without uploading:
+
+```bash
+polyvault put hello.txt --dry-run
+```
 
 ### Extra replicas
 
@@ -280,7 +286,7 @@ polyvault provider add dropbox --name dropbox --client-id … --client-secret �
 polyvault provider add webdav --name nextcloud \
   --base-url https://cloud.example/remote.php/dav/files/alice \
   --username alice --password 'app-password'
-polyvault provider add s3 --name b2 …   # another bucket via relay
+polyvault provider add s3 --name b2 …   # another free/cheap bucket via relay
 ```
 
 Dropbox: create an app at [https://www.dropbox.com/developers/apps](https://www.dropbox.com/developers/apps) (Scoped access, Full Dropbox), enable `files.content.write` / `files.content.read`, add redirect `http://127.0.0.1:8765/callback`.
@@ -302,6 +308,7 @@ polyvault provider add dropbox …       # optional
 polyvault provider add webdav …        # optional
 
 echo 'hello from polyvault' > hello.txt
+polyvault put hello.txt --dry-run
 polyvault put hello.txt
 polyvault status
 ```
@@ -311,8 +318,8 @@ Expected modes:
 | Destination | Mode |
 |-------------|------|
 | R2 | `hub-upload` |
-| OneDrive Personal | `onedrive-url-pull` |
-| Google Drive / Dropbox / WebDAV / extra S3 | `relay` (parallel on VM) |
+| Google Drive / OneDrive / Dropbox / WebDAV / extra S3 | `relay` (parallel on VM) |
+| Local folder | `hub-copy` |
 | Already present (same size) | `skipped` |
 | Cloud without relay (and no `--bridge`) | fails with SETUP tip |
 
@@ -326,7 +333,7 @@ Expected modes:
 | Oracle “Out of capacity” | Retry AD / smaller shape / different time; AMD micro VMs are an alternative. |
 | Google `redirect_uri_mismatch` | URI must be exactly `http://127.0.0.1:8765/callback`. |
 | Google blocked / unverified app | Add yourself as test user on the consent screen. |
-| OneDrive URL-pull fails | Personal preview only; set relay so it joins the fan-out batch. |
 | Relay 401 | `RELAY_TOKEN` on VM must match `polyvault relay set --token`. |
 | Relay can’t reach R2 URL | VM needs outbound HTTPS; security list egress usually open by default. |
 | Cloud replica fails without relay | Run Oracle relay + `relay set`, or pass `--bridge` (uses your laptop). |
+| Expecting OneDrive URL-pull | Removed — Microsoft retired that API; use relay instead. |

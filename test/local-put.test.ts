@@ -139,6 +139,28 @@ describe("hub upload-once + replicate", () => {
     assert.equal(replica?.mode, "skipped");
   });
 
+  it("dry-run plans hub-copy without writing", async () => {
+    const file = join(home, "dry.txt");
+    await writeFile(file, "dry-run-payload\n");
+    const beforeHub = await readFile(
+      join(hubPath, "PolyVault", "hello.txt"),
+      "utf8",
+    ).catch(() => null);
+    const outcomes = await runPut(file, { dryRun: true });
+    assert.equal(outcomes.length, 0);
+    const after = await readFile(join(hubPath, "PolyVault", "dry.txt"), "utf8").catch(
+      () => null,
+    );
+    assert.equal(after, null);
+    // prior hub content unchanged
+    if (beforeHub !== null) {
+      assert.equal(
+        await readFile(join(hubPath, "PolyVault", "hello.txt"), "utf8"),
+        beforeHub,
+      );
+    }
+  });
+
   it("isolates replica failures after hub success", async () => {
     const blocker = join(home, "blocker");
     await writeFile(blocker, "not-a-dir");

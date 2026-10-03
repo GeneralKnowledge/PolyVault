@@ -80,7 +80,6 @@ export interface RelayConfig {
 export type ReplicateMode =
   | "hub-upload"
   | "relay"
-  | "onedrive-url-pull"
   | "hub-copy"
   | "laptop-bridge"
   | "skipped";
@@ -162,7 +161,7 @@ export function allProviders(config: PolyVaultConfig): ProviderConfig[] {
   return config.hub ? [config.hub, ...config.replicas] : [...config.replicas];
 }
 
-/** Cloud destinations that should leave the laptop via URL-pull or relay. */
+/** Cloud destinations that should leave the laptop via the free-tier relay. */
 export function isCloudReplica(kind: ProviderKind): boolean {
   return (
     kind === "s3" ||
