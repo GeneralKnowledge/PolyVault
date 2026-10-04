@@ -1,7 +1,7 @@
 {
   "name": "polyvault",
-  "version": "0.2.0",
-  "description": "Upload once to a free R2 hub; replicate to Drive/OneDrive via URL-pull or free relay.",
+  "version": "0.3.0",
+  "description": "Upload once to a free R2 hub; fan out to Drive/OneDrive/Dropbox via a free-tier relay.",
   "type": "module",
   "bin": {
     "polyvault": "./dist/cli.js"
